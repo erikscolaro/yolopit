@@ -10,14 +10,14 @@ on it.
 ## Install
 
 ```bash
-pip install "yolopit[search] @ git+https://github.com/erikscolaro/yolopit@v0.1.0"
+pip install "yolopit @ git+https://github.com/erikscolaro/yolopit@v0.1.0"
 ```
 
-- `yolopit` alone (torch + Ultralytics) is enough to **load, run and fine-tune** a pruned model.
-- `[search]` adds PLiNIO, needed only for the search. yolopit patches some PLiNIO internals, so
-  PLiNIO is pinned to one commit.
+PLiNIO is installed with it, pinned to one commit (yolopit patches some PLiNIO internals).
+Loading and running a pruned model does not import it: pruned checkpoints only need
+`yolopit.runtime`.
 
-For development: `pip install -e ".[search,test]"`.
+For development: `pip install -e ".[test]"`.
 
 ## Use
 
@@ -106,3 +106,8 @@ PIT, the pruning method used here, is described in:
 ```
 
 YOLO26 and the training framework are by Ultralytics (https://github.com/ultralytics/ultralytics).
+
+## License
+
+AGPL-3.0 (see `LICENSE`), the license of Ultralytics, which yolopit extends. PLiNIO is
+Apache-2.0.

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,18 +9,22 @@ description = "Structured channel pruning of Ultralytics YOLO26 with PLiNIO PIT,
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "Erik Scolaro"}]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 # Versions are pinned in step 3 (see README, "Versions").
 dependencies = [
     "torch",
     "ultralytics",
     "pyyaml",
     "matplotlib",
+    # yolopit patches PLiNIO internals: keep this exact commit. PLiNIO's setup.py does not
+    # declare its own requirements, so the ones PIT imports are listed here.
+    "networkx",
+    "tdigest",
+    "plinio @ git+https://github.com/eml-eda/plinio.git@3d6b5e08b3c7d861620ecc9ab25bff82852f8c7c",
 ]
 
 [project.optional-dependencies]
-# PLiNIO is needed only for the search (yolopit.search / yolopit.masks), not to load or
-# fine-tune a pruned model. The code patches PLiNIO internals: keep this exact commit.
-search = ["plinio @ git+https://github.com/eml-eda/plinio.git@3d6b5e08b3c7d861620ecc9ab25bff82852f8c7c"]
 test = ["pytest", "onnx", "onnxruntime"]
 
 [tool.setuptools]
