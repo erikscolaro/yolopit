@@ -1,9 +1,9 @@
 # Example PIT search config: Ultralytics train arguments + PIT settings, all at top level.
-# Usage:  PITYOLO("modello_finetunato.pt", n=16, cost="ops").train(cfg="examples/search.yaml")
+# Usage:  PITYOLO("model_trained_on_your_data.pt", n=16, cost="ops").train(cfg="search.yaml")
 # Keyword arguments passed to train() override these values.
 
 # --- Ultralytics (weights) -------------------------------------------------------------
-data: coco128.yaml        # dataset yaml (es. /content/drive/MyDrive/aod4/data.yaml)
+data: path/to/your_data.yaml   # Ultralytics dataset yaml
 epochs: 100
 imgsz: 640
 batch: 16
@@ -13,7 +13,7 @@ lr0: 0.001                # weights scheduler: Ultralytics' own (linear, or cosi
 lrf: 0.01
 cos_lr: false
 warmup_epochs: 0          # input model already trained on the data: no LR warmup (warning if > 0)
-project: /content/pit_runs  # su Colab: meglio un percorso su Drive
+project: runs/yolopit      # an absolute path avoids surprises
 name: search
 
 # --- PIT -------------------------------------------------------------------------------

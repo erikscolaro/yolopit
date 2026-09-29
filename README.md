@@ -1,47 +1,108 @@
-# PIT channel search per YOLO26 — pacchetto Colab
+# yolopit
 
-Pipeline completa: **ricerca PIT (PLiNIO) → export del modello prunato → validazione del modello
-esportato → fine-tuning → validazione finale**. Niente export ONNX.
+Structured channel pruning of Ultralytics **YOLO26** with **PLiNIO PIT**, in blocks of N
+channels, with the Ultralytics training experience (progress bars, `results.csv`, plots,
+`YOLO(...)` API).
 
-## Contenuto
+The dataset is yours: yolopit takes any Ultralytics dataset yaml and a model already trained
+on it.
 
-| File | |
-|---|---|
-| `PIT_YOLO_colab.ipynb` | notebook: installa le dipendenze ed esegue tutta la pipeline |
-| `pit_yolo.py` | API (`PITYOLO`), trainer della ricerca e del fine-tuning, `C3k2Split`, wrapper fx |
-| `pit_block_masks.py` | maschere a blocchi di N canali, ripristino BN all'export, fix PLiNIO |
-| `search.yaml` | configurazione di esempio (Ultralytics + PIT) se preferisci il YAML |
+## Install
 
-## Uso su Colab
+```bash
+pip install "yolopit[search] @ git+https://github.com/erikscolaro/yolopit@v0.1.0"
+```
 
-1. Apri `PIT_YOLO_colab.ipynb` su Colab, runtime **GPU**.
-2. Cella 1: lascia `ZIP_ON_DRIVE = ""` e carica questo zip quando richiesto, oppure mettilo su
-   Drive e scrivi il percorso.
-3. Cella 3: imposta `MODEL` (il tuo modello già addestrato), `DATA` (yaml del dataset), `N`,
-   epoche e scheduler. Per non perdere i risultati metti `PROJECT` su Drive.
-4. Esegui tutto.
+- `yolopit` alone (torch + Ultralytics) is enough to **load, run and fine-tune** a pruned model.
+- `[search]` adds PLiNIO, needed only for the search. yolopit patches some PLiNIO internals, so
+  PLiNIO is pinned to one commit.
 
-La cella 2 installa Ultralytics 8.4.165 e PLiNIO al commit `3d6b5e0` (versioni testate) più
-`networkx`, `tdigest`, `onnx`. PyTorch resta quello di Colab. Se Ultralytics era già stato
-importato in un'altra versione, riavvia il runtime e riesegui.
+For development: `pip install -e ".[search,test]"`.
 
-## Output (in `PROJECT/NAME/`)
+## Use
 
-- `search/`: tutto quello di Ultralytics + `pit_results.png` (costo, mAP, learning rate di pesi e
-  maschere, canali per layer), `channels.csv`, `pit_args.yaml`, `weights/pruned.pt`
-- `val_after_export/`: validazione del modello esportato (deve coincidere con la fine della ricerca)
-- `finetune/`: fine-tuning del modello prunato (`weights/best.pt` = modello finale)
-- `val_final/`, `summary.json`
+```python
+from yolopit import PITYOLO, PrunedTrainer
 
-## Default
+search = PITYOLO("model_trained_on_your_data.pt", n=16, cost="ops")
+search.train(data="your_data.yaml", epochs=30, imgsz=640, batch=16)   # or cfg="search.yaml"
+pruned = search.export_pruned()                  # ultralytics.YOLO, saved as pruned.pt
+pruned.train(data="your_data.yaml", epochs=30, trainer=PrunedTrainer)
+pruned.val(data="your_data.yaml")
+```
 
-Pensati per "modello già addestrato sui dati → ricerca → fine-tuning": pesi con SGD e nessun
-warmup, maschere con AdamW e scheduler proprio (separato da quello dei pesi), AMP sempre spenta
-nella ricerca. Warning se attivi un warmup.
+`examples/quickstart.py` runs the same workflow from the command line, `examples/pipeline.py`
+also checks every step (validation after export, fine-tuning, ONNX), `examples/search.yaml`
+lists all the settings.
 
-## Da sapere
+## What it does
 
-- Solo detection, architetture YOLO26 (C3k2 prunabile; C2PSA, attenzione e Detect non prunati).
-- `resume` e multi-GPU non supportati.
-- N va scelto sulla larghezza SIMD del target: canali non allineati possono rendere il modello
-  prunato più lento di quello originale.
+- **C3k2** blocks are replaced by an exactly equivalent version without `chunk` (`C3k2Split`),
+  so PIT can prune inside them. C2PSA, PSABlock (attention) and Detect are not pruned; the layers
+  feeding them keep their output channels.
+- Channels are switched on and off in **blocks of N**. When the channel count is not a multiple
+  of N, the leftover block is the first to be pruned; layers with fewer than N channels are not
+  pruned.
+- The masks have **their own optimizer and scheduler** (AdamW by default), separate from the
+  weights (SGD by default, any Ultralytics optimizer allowed). No warmup and AMP off by default,
+  with a warning if you turn a warmup on.
+- `export_pruned()` gives a plain pruned model with the trained BatchNorm values, loadable with
+  `YOLO("pruned.pt")`.
+
+## Package layout
+
+| module | needs PLiNIO | content |
+|---|---|---|
+| `yolopit.runtime` | no | `C3k2Split`, `YoloFx`, `FxDetectionModel`: what a pruned checkpoint contains |
+| `yolopit.finetune` | no | `PrunedTrainer` |
+| `yolopit.search` | yes | `PITYOLO`, `PITSearchTrainer`, `build_pit_model` |
+| `yolopit.masks` | yes | block masks, BN restore, PLiNIO fixes |
+| `yolopit.plots` | no | `pit_results.png` |
+
+The class paths in `yolopit.runtime` are part of the checkpoint format: a pruned `.pt` stores
+them, so they must not move.
+
+**Checkpoints made before yolopit 0.1** store `pit_yolo.FxDetectionModel`. The `pit_yolo` and
+`pit_block_masks` modules installed with the package keep them loadable (loading them also needs
+PLiNIO, because they reference its tracer). New checkpoints need neither.
+
+## Tests
+
+```bash
+pytest            # fast checks (~2 min on CPU)
+pytest -m slow    # short trainings on coco8 (~2 min on CPU)
+```
+
+## Credits
+
+The search is built on **PLiNIO** by the EML-EDA group at Politecnico di Torino
+(https://github.com/eml-eda/plinio, Apache-2.0). As the PLiNIO authors ask, if you use this
+work please acknowledge their paper:
+
+```bibtex
+@misc{plinio,
+      title={PLiNIO: A User-Friendly Library of Gradient-based Methods for Complexity-aware DNN Optimization},
+      author={D. {Jahier Pagliari} and M. {Risso} and B. A. {Motetti} and A. {Burrello}},
+      year={2023},
+      eprint={2307.09488},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
+```
+
+PIT, the pruning method used here, is described in:
+
+```bibtex
+@article{risso2023pit,
+      title={Lightweight Neural Architecture Search for Temporal Convolutional Networks at the Edge},
+      author={M. Risso and A. Burrello and F. Conti and L. Lamberti and Y. Chen and L. Benini and E. Macii and M. Poncino and D. {Jahier Pagliari}},
+      journal={IEEE Transactions on Computers},
+      volume={72},
+      number={3},
+      pages={744--758},
+      year={2023},
+      doi={10.1109/TC.2022.3177955}
+}
+```
+
+YOLO26 and the training framework are by Ultralytics (https://github.com/ultralytics/ultralytics).

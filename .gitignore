@@ -1,0 +1,6 @@
+yolo26n.pt
+__pycache__/
+*.egg-info/
+tests/_out/
+runs/
+*.onnx

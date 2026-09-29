@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yolopit"
+version = "0.1.0"
+description = "Structured channel pruning of Ultralytics YOLO26 with PLiNIO PIT, in blocks of N channels"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Erik Scolaro"}]
+# Versions are pinned in step 3 (see README, "Versions").
+dependencies = [
+    "torch",
+    "ultralytics",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+# PLiNIO is needed only for the search (yolopit.search / yolopit.masks), not to load or
+# fine-tune a pruned model. The code patches PLiNIO internals: keep this exact commit.
+search = ["plinio @ git+https://github.com/eml-eda/plinio.git@3d6b5e08b3c7d861620ecc9ab25bff82852f8c7c"]
+test = ["pytest", "onnx", "onnxruntime"]
+
+[tool.setuptools]
+packages = ["yolopit"]
+# old module names, kept so that checkpoints and scripts made before 0.1 still load
+py-modules = ["pit_yolo", "pit_block_masks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: trains on coco8 (minutes on CPU)"]
+addopts = "-m 'not slow'"
