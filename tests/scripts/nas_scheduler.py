@@ -52,7 +52,7 @@ base = dict(data="coco8.yaml", epochs=EPOCHS, pit_warmup_epochs=WARM, lam=1.0, n
 def run(name, yaml_extra, kwargs=None, expect=None, fn=None):
     cfg = OUT / f"{name}.yaml"
     cfg.write_text(yaml.safe_dump({**base, **yaml_extra, "name": name}))
-    s = PITYOLO("yolo26n.pt", n=4, cost="ops", trace_imgsz=320)
+    s = PITYOLO("yolo26n.pt", n=4, trace_imgsz=320)
     s.train(cfg=str(cfg), **(kwargs or {}))
     tr = s.trainer
     rows = list(csv.DictReader(open(Path(tr.save_dir) / "results.csv")))
@@ -78,15 +78,16 @@ run("cosine", {"nas_lrf": 0.1, "nas_cos_lr": True}, expect=(0.1, True))
 run("constant", {}, expect=(1.0, False))
 tr, saved = run("override", {"nas_lrf": 0.1, "nas_cos_lr": True},
                 kwargs={"nas_cos_lr": False, "nas_lrf": 0.5}, expect=(0.5, False))
-check(saved["nas_lrf"] == 0.5 and saved["nas_cos_lr"] is False,
+check(saved["nas"]["lrf"] == 0.5 and saved["nas"]["cos_lr"] is False,
       f"keyword arguments override the YAML, pit_args.yaml saved ({saved})")
+run("grouped_yaml", {"nas": {"lrf": 0.1, "cos_lr": True}}, expect=(0.1, True))
 custom = lambda e, total: 1.0 if e < 2 else 0.25                           # step schedule
 run("custom_lambda", {}, kwargs={"nas_lr_lambda": custom}, expect=(1.0, False), fn=custom)
 
 bad = OUT / "bad.yaml"
 bad.write_text(yaml.safe_dump({**base, "nas_lr_lambda": "x"}))
 try:
-    PITYOLO("yolo26n.pt", n=4, cost="ops", trace_imgsz=320).train(cfg=str(bad))
+    PITYOLO("yolo26n.pt", n=4, trace_imgsz=320).train(cfg=str(bad))
     refused = False
 except ValueError:
     refused = True

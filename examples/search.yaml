@@ -1,6 +1,8 @@
-# Example PIT search config: Ultralytics train arguments + PIT settings, all at top level.
-# Usage:  PITYOLO("model_trained_on_your_data.pt", n=16, cost="ops").train(cfg="search.yaml")
-# Keyword arguments passed to train() override these values.
+# Search config: Ultralytics train arguments at top level + the yolopit groups pit, nas,
+# regularizer.  Usage:
+#   search = PITYOLO("model_trained_on_your_data.pt", cfg="search.yaml")
+#   search.train()                      # keyword arguments override this file
+# The model should already be trained on the dataset: the search starts from it.
 
 # --- Ultralytics (weights) -------------------------------------------------------------
 data: path/to/your_data.yaml   # Ultralytics dataset yaml
@@ -13,15 +15,31 @@ lr0: 0.001                # weights scheduler: Ultralytics' own (linear, or cosi
 lrf: 0.01
 cos_lr: false
 warmup_epochs: 0          # input model already trained on the data: no LR warmup (warning if > 0)
-project: runs/yolopit      # an absolute path avoids surprises
+project: runs/yolopit     # an absolute path avoids surprises
 name: search
 
-# --- PIT -------------------------------------------------------------------------------
-pit_warmup_epochs: 0      # epochs with frozen masks before the search (warning if > 0)
-lam: 1.0                  # weight of the cost term (cost = fraction of the initial cost)
-nas_optimizer: AdamW      # AdamW | Adam | SGD (momentum 0.9)
-nas_lr0: 0.01             # masks scheduler: same formulas as lr0/lrf/cos_lr, over the SEARCH
-nas_lrf: 0.01             #   epochs (epochs - pit_warmup_epochs); nas_lrf: 1.0 -> constant
-nas_cos_lr: false         #   true -> cosine instead of linear
-nas_weight_decay: 0.0
-# nas_lr_lambda: only from Python, e.g. train(cfg=..., nas_lr_lambda=lambda e, n: 0.5 ** (e // 10))
+# --- search space (fixed when the model is built: PITYOLO reads it from here) ----------
+pit:
+  n: 16                   # channels pruned in blocks of N (pick it for your hardware)
+  remainder: true         # a C % N leftover block is kept, and it is the first to be pruned
+  trace_imgsz: null       # image size of the costs; null -> imgsz above
+  warmup_epochs: 0        # epochs with frozen masks before the search (warning if > 0)
+  ema: false              # EMA of the weights during the search (off: validate the current model)
+
+# --- masks optimizer and scheduler (separate from the weights) --------------------------
+nas:
+  optimizer: AdamW        # AdamW | Adam | SGD (momentum 0.9)
+  lr0: 0.01               # same formulas as lr0/lrf/cos_lr, over the search epochs
+  lrf: 1.0                # final lr = lr0 * lrf; 1.0 -> constant
+  cos_lr: false
+  weight_decay: 0.0
+  # lr_lambda: only from Python, e.g. train(nas={"lr_lambda": lambda e, n: 0.5 ** (e // 10)})
+
+# --- cost term in the loss ---------------------------------------------------------------
+# Costs are of the WHOLE model at trace_imgsz: ops = MACs, params = parameters (BN excluded).
+regularizer:
+  mode: standard          # standard: prune as long as lambda outweighs the accuracy loss
+  lambda: {ops: 1.0}      #   weight per cost, each as a fraction of its initial value
+  # mode: duccio          # duccio: push each cost down to its target, then stop pushing
+  # target: {ops: 40%}    #   absolute (1.2G, 800M, 2e6) or % of the input model; a target
+  #                       #   below the minimum reachable stops with an error

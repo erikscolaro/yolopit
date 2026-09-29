@@ -10,7 +10,7 @@ on it.
 ## Install
 
 ```bash
-pip install "yolopit @ git+https://github.com/erikscolaro/yolopit@v0.1.0"
+pip install "yolopit @ git+https://github.com/erikscolaro/yolopit@v0.2.0"
 ```
 
 PLiNIO is installed with it, pinned to one commit (yolopit patches some PLiNIO internals).
@@ -44,16 +44,52 @@ https://pytorch.org/get-started/previous-versions/), then yolopit.
 ```python
 from yolopit import PITYOLO, PrunedTrainer
 
-search = PITYOLO("model_trained_on_your_data.pt", n=16, cost="ops")
-search.train(data="your_data.yaml", epochs=30, imgsz=640, batch=16)   # or cfg="search.yaml"
+search = PITYOLO("model_trained_on_your_data.pt", cfg="search.yaml")   # or n=16, ...
+search.train()                                   # keyword arguments override the config
 pruned = search.export_pruned()                  # ultralytics.YOLO, saved as pruned.pt
 pruned.train(data="your_data.yaml", epochs=30, trainer=PrunedTrainer)
 pruned.val(data="your_data.yaml")
 ```
 
-`examples/quickstart.py` runs the same workflow from the command line, `examples/pipeline.py`
-also checks every step (validation after export, fine-tuning, ONNX), `examples/search.yaml`
-lists all the settings.
+`examples/search.yaml` lists every setting, `examples/quickstart.py` runs the workflow from the
+command line, `examples/pipeline.py` also checks every step (validation after export,
+fine-tuning, ONNX).
+
+### Search config
+
+Ultralytics train arguments at top level, plus three groups:
+
+```yaml
+pit:          {n: 16, remainder: true, trace_imgsz: null, warmup_epochs: 0, ema: false}
+nas:          {optimizer: AdamW, lr0: 0.01, lrf: 1.0, cos_lr: false, weight_decay: 0.0}
+regularizer:  {mode: standard, lambda: {ops: 1.0}}          # or
+regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}}
+```
+
+- `pit` fixes the search space, so `PITYOLO(...)` reads it when it builds the model.
+- `nas`: optimizer and scheduler of the masks, separate from the weights.
+- `regularizer`: the cost term in the loss.
+  - `standard`: `lambda` per cost (each cost as a fraction of its initial value). Pruning goes
+    on as long as the lambda outweighs the accuracy loss.
+  - `duccio`: a target per cost, absolute (`1.2G`, `800M`, `2e6`) or `%` of the input model.
+    Each cost is pushed down only while it is above its target (PLiNIO's DUCCIO). A target
+    below the minimum reachable stops with an error that says what the minimum is.
+- The old flat keys (`lam`, `nas_lr0`, `pit_warmup_epochs`, ...) still work.
+
+### Costs
+
+Both costs are tracked for the **whole model** at `trace_imgsz` (default: `imgsz`):
+
+- `ops`: MACs of convolutions and linear layers (PLiNIO's formula) plus the attention matmuls.
+- `params`: weights and biases (BatchNorm excluded: it is folded into the convolutions).
+- Detect: only the branch used at inference.
+
+PLiNIO sees only the prunable layers, so yolopit adds the part it does not see (attention,
+Detect, layers feeding them), measured once. At the start the search prints total, prunable
+part, fixed part and the minimum reachable (every prunable layer at one block of N).
+`results.csv` has `train/ops` and `train/params` (current architecture / initial) and
+`train/reg` (the cost term). `pit_summary.json` has initial, final and minimum costs and the
+targets.
 
 ## What it does
 
@@ -64,8 +100,8 @@ lists all the settings.
   of N, the leftover block is the first to be pruned; layers with fewer than N channels are not
   pruned.
 - The masks have **their own optimizer and scheduler** (AdamW by default), separate from the
-  weights (SGD by default, any Ultralytics optimizer allowed). No warmup and AMP off by default,
-  with a warning if you turn a warmup on.
+  weights (SGD by default, any Ultralytics optimizer allowed). No warmup, AMP off and EMA off in
+  the search by default, with a warning if you turn a warmup on.
 - `export_pruned()` gives a plain pruned model with the trained BatchNorm values, loadable with
   `YOLO("pruned.pt")`.
 
@@ -77,6 +113,9 @@ lists all the settings.
 | `yolopit.finetune` | no | `PrunedTrainer` |
 | `yolopit.search` | yes | `PITYOLO`, `PITSearchTrainer`, `build_pit_model` |
 | `yolopit.masks` | yes | block masks, BN restore, PLiNIO fixes |
+| `yolopit.config` | no | search config: groups, defaults, checks |
+| `yolopit.costs` | no | real cost of the whole model, fixed part |
+| `yolopit.regularizers` | yes | standard and DUCCIO cost terms |
 | `yolopit.plots` | no | `pit_results.png` |
 
 The class paths in `yolopit.runtime` are part of the checkpoint format: a pruned `.pt` stores
@@ -122,6 +161,19 @@ PIT, the pruning method used here, is described in:
       pages={744--758},
       year={2023},
       doi={10.1109/TC.2022.3177955}
+}
+```
+
+The `duccio` mode uses PLiNIO's DUCCIO regularizer, from:
+
+```bibtex
+@inproceedings{risso2022duccio,
+      title={Multi-Complexity-Loss DNAS for Energy-Efficient and Memory-Constrained Deep Neural Networks},
+      author={M. Risso and A. Burrello and L. Benini and E. Macii and M. Poncino and D. {Jahier Pagliari}},
+      booktitle={ACM/IEEE International Symposium on Low Power Electronics and Design (ISLPED)},
+      pages={1--6},
+      year={2022},
+      doi={10.1145/3531437.3539720}
 }
 ```
 

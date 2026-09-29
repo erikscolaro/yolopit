@@ -68,7 +68,7 @@ with torch.no_grad():
 check(n_rep > 0 and d == 0.0, f"{n_rep} C3k2 -> C3k2Split, network output identical (diff {d})")
 
 # --- 2. PIT model, half of the blocks of every prunable masker off
-wrapper = build_pit_model("yolo26n.pt", n=N, cost="ops", trace_imgsz=IMG, verbose=False)
+wrapper = build_pit_model("yolo26n.pt", n=N, trace_imgsz=IMG, verbose=False)
 pit = wrapper.net
 maskers = {id(l.out_features_masker): l.out_features_masker for l in pit.seed.modules()
            if isinstance(getattr(l, "out_features_masker", None), PITBlockFeaturesMasker)}

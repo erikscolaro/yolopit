@@ -24,7 +24,7 @@ args = ap.parse_args()
 common = dict(imgsz=args.imgsz, batch=args.batch, device=args.device, project="runs/yolopit",
               exist_ok=True)
 
-search = PITYOLO(args.model, n=args.n, cost="ops", trace_imgsz=args.imgsz)
+search = PITYOLO(args.model, n=args.n, trace_imgsz=args.imgsz)
 search.train(data=args.data, epochs=args.epochs, name="search", **common)
 pruned = search.export_pruned()                      # runs/yolopit/search/weights/pruned.pt
 pruned.train(data=args.data, epochs=args.ft_epochs, name="finetune", trainer=PrunedTrainer,

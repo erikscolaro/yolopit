@@ -1,11 +1,11 @@
-"""PIT (PLiNIO) channel search for Ultralytics YOLO26 (requires PLiNIO).
+"""PIT (PLiNIO) channel search for Ultralytics YOLO26.
 
 PIT and PLiNIO are by the EML-EDA group, Politecnico di Torino: see README, "Credits".
 
     from yolopit import PITYOLO, PrunedTrainer
 
-    search = PITYOLO("model_trained_on_your_data.pt", n=16, cost="ops")
-    search.train(data="your_data.yaml", epochs=30, imgsz=640, batch=16)
+    search = PITYOLO("model_trained_on_your_data.pt", cfg="search.yaml")   # or n=16, ...
+    search.train()                                   # or train(data=..., epochs=..., ...)
     pruned = search.export_pruned()                  # ultralytics.YOLO, saved as pruned.pt
     pruned.train(data="your_data.yaml", epochs=30, trainer=PrunedTrainer)
 
@@ -14,15 +14,18 @@ PIT and PLiNIO are by the EML-EDA group, Politecnico di Torino: see README, "Cre
 - The Ultralytics forward is replaced by a static, fx-traceable loop (YoloFx).
 - Layers feeding a leaf keep their OUTPUT channels (inputs still adapt).
 - Channels are pruned in blocks of N (yolopit.masks.apply_block_masks, leftover block first).
-- PITSearchTrainer (DetectionTrainer subclass) adds: optional PIT warmup with frozen masks, the
-  cost term in the loss (`cost` column = real cost of the current architecture / initial cost),
-  a SEPARATE optimizer and scheduler for the masks, AMP always off, masks copied (not averaged)
-  into the EMA, state_dict checkpoints (PLiNIO models cannot be pickled), a channel report.
+- Both costs (`ops` = MACs, `params`) are tracked for the WHOLE model: PLiNIO's cost of the PIT
+  layers plus the fixed part it cannot see (yolopit.costs).
+- The cost term in the loss is `standard` (lambda per cost) or `duccio` (target per cost).
+- PITSearchTrainer (DetectionTrainer subclass) adds: optional PIT warmup with frozen masks, a
+  SEPARATE optimizer and scheduler for the masks, AMP always off, EMA off by default, state_dict
+  checkpoints (PLiNIO models cannot be pickled), a channel report and pit_summary.json.
 """
 from __future__ import annotations
 
 import copy
 import csv
+import json
 from pathlib import Path
 
 import torch
@@ -34,7 +37,7 @@ from .masks import (PITBlockFeaturesMasker, apply_block_masks, freeze_output_cha
 
 from plinio.methods import PIT
 from plinio.methods.pit import graph as pit_graph
-from plinio.methods.pit.nn import PITConv2d
+from plinio.methods.pit.nn import PITConv2d, PITModule
 from plinio.methods.pit.nn.features_masker import (PITConcatFeaturesMasker, PITFeaturesMasker,
                                                    PITFrozenFeaturesMasker)
 import plinio.graph.inspection as _insp
@@ -48,12 +51,18 @@ from ultralytics.nn.modules.block import PSABlock
 from ultralytics.utils import DEFAULT_CFG, LOGGER, colorstr
 from ultralytics.utils.torch_utils import unwrap_model
 
+from . import __version__ as YOLOPIT_VERSION
+from . import config as _config
 from ._common import apply_pit_defaults, enable_grads
+from .config import ConfigError
+from .costs import COUNTED, count_outside, fixed_costs, fmt
 from .plots import plot_pit_results
+from .regularizers import DuccioRegularizer, StandardRegularizer
 from .runtime import C3k2Split, FxDetectionModel, YoloFx, detach_tracer
 
 LEAVES = (C2PSA, PSABlock, Detect)
-COSTS = {"params": _cost_params, "ops": _cost_ops}
+COSTS = {"ops": _cost_ops, "params": _cost_params}
+
 
 # ============================================================================ fx / PLiNIO patches
 def _install_patches(leaves=LEAVES):
@@ -80,12 +89,18 @@ _install_patches()
 # ============================================================================ search model
 class PITDetectionModel(FxDetectionModel):
     """FxDetectionModel whose `net` is the PIT model: adds the cost term to the loss, the real
-    cost of the current architecture and the per-layer channel report."""
+    costs of the current architecture (loss items `ops`, `params`, `reg`) and the channel
+    report."""
 
     def __init__(self, net: nn.Module, detect: Detect, src):
         super().__init__(net, detect, src)
-        self.lam = 0.0          # cost weight in the loss
-        self.cost0 = None       # initial cost
+        self.regularizer = None     # StandardRegularizer | DuccioRegularizer, set by train()
+        self.search_active = False  # set by the trainer: cost term only in the search phase
+        self.reg_epoch, self.reg_epochs = 0, 1
+        self.cost0 = {}             # PIT part, initial
+        self.fixed = {}             # part PIT does not see (constant)
+        self.total0 = {}            # whole model, initial
+        self.min_total = {}         # whole model, every prunable layer at one block
 
     @property
     def is_pit(self) -> bool:
@@ -93,27 +108,37 @@ class PITDetectionModel(FxDetectionModel):
 
     def loss(self, batch, preds=None):
         loss, items = super().loss(batch, preds)
-        if self.is_pit and self.cost0:
-            cost = self.net.cost / self.cost0              # soft cost fraction (differentiable)
-            if self.lam > 0 and self.training:
-                # the criterion returns a VECTOR of components (summed by the trainer): the cost
-                # term is appended as one more component, scaled like the others (x batch size)
-                term = (self.lam * cost * batch["img"].shape[0]).reshape(1).to(loss.dtype)
-                loss = torch.cat([loss.reshape(-1), term.to(loss.device)])
-            items = dict(items)
-            items["cost"] = self.real_cost_fraction().to(loss.device)
+        if not (self.is_pit and self.total0):
+            return loss, items
+        items = dict(items)
+        reg_value = torch.zeros((), device=loss.device)
+        if self.training and self.search_active and self.regularizer is not None:
+            bs = batch["img"].shape[0]
+            if isinstance(self.regularizer, DuccioRegularizer) and not self.regularizer.ready:
+                self.regularizer.start(float(loss.detach().sum()) / bs)   # task loss per image
+            reg = self.regularizer(self.net, self.reg_epoch, self.reg_epochs)
+            reg = torch.as_tensor(reg).to(loss.device)
+            # the criterion returns a VECTOR of components (summed by the trainer) scaled by the
+            # batch size: the cost term is appended as one more component, scaled the same way
+            loss = torch.cat([loss.reshape(-1), (reg * bs).reshape(1).to(loss.dtype)])
+            reg_value = reg.detach().reshape(())
+        for m, v in self.real_costs(fraction=True).items():
+            items[m] = v.to(loss.device)
+        items["reg"] = reg_value
         return loss, items
 
     @torch.no_grad()
-    def real_cost_fraction(self) -> torch.Tensor:
-        """Cost of the CURRENT architecture (binarized masks, i.e. what the export would give),
-        as a fraction of the initial cost. Shown as the `cost` column."""
+    def real_costs(self, fraction: bool = False) -> dict:
+        """Costs of the WHOLE model with the CURRENT architecture (binarized masks, i.e. what the
+        export gives): PIT part + fixed part. fraction=True: as a fraction of the initial ones."""
         prev = self.net.discrete_cost
         self.net.discrete_cost = True
         try:
-            return (self.net.cost / self.cost0).detach().reshape(())
+            out = {m: self.net.get_cost(m).detach().float().reshape(()) + self.fixed[m]
+                   for m in self.total0}
         finally:
             self.net.discrete_cost = prev
+        return {m: v / self.total0[m] for m, v in out.items()} if fraction else out
 
     # --- reports
     def channel_report(self):
@@ -132,9 +157,32 @@ class PITDetectionModel(FxDetectionModel):
         return rows
 
 
-def build_pit_model(model="yolo26n.pt", n=8, remainder=True, cost="ops", trace_imgsz=320,
-                    verbose=True) -> PITDetectionModel:
-    """YOLO26 weights/yaml -> PITDetectionModel wrapping a PIT model with block masks."""
+def _pit_costs(pit, minimum: bool = False) -> dict:
+    """Discrete PIT cost of each metric; minimum=True: with every block mask off (each prunable
+    layer keeps only its keep-alive block), the masks are restored afterwards."""
+    maskers = {id(l.out_features_masker): l.out_features_masker for l in pit.seed.modules()
+               if isinstance(getattr(l, "out_features_masker", None), PITBlockFeaturesMasker)}
+    saved = {k: m.block.detach().clone() for k, m in maskers.items()}
+    prev = pit.discrete_cost
+    pit.discrete_cost = True
+    try:
+        with torch.no_grad():
+            if minimum:
+                for m in maskers.values():
+                    m.block.zero_()
+            return {name: float(pit.get_cost(name)) for name in COSTS}
+    finally:
+        with torch.no_grad():
+            for k, m in maskers.items():
+                m.block.copy_(saved[k])
+        pit.discrete_cost = prev
+
+
+def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, verbose=True,
+                    cost=None) -> PITDetectionModel:
+    """YOLO26 weights/yaml -> PITDetectionModel wrapping a PIT model with block masks, with the
+    costs of the whole model (initial, fixed part, minimum) at trace_imgsz. `cost` is ignored
+    (kept for old calls: both costs are always tracked)."""
     src = YOLO(model).model.float().eval()
     for p in src.parameters():      # checkpoints load frozen; the trainer would re-enable them
         p.requires_grad_(True)       # anyway, with one warning per parameter
@@ -142,26 +190,91 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, cost="ops", trace_i
         if isinstance(layer, C3k2):
             src.model[i] = C3k2Split(layer).eval()
     detect = src.model[-1]
+    fixed, info = fixed_costs(src, LEAVES, detect, trace_imgsz, COSTS)
+    outside = count_outside(src, LEAVES)
+
     net = YoloFx(src.model, src.save).eval()
     detect.export = True                    # single-tensor output while PLiNIO traces the graph
     try:
-        pit = PIT(net, cost=COSTS[cost], input_shape=(3, trace_imgsz, trace_imgsz),
+        pit = PIT(net, cost=dict(COSTS), input_shape=(3, trace_imgsz, trace_imgsz),
                   train_rf=False, train_dilation=False)
     finally:
         detect.export = False
+    n_pit = sum(1 for m in pit.seed.modules() if isinstance(m, PITModule) and isinstance(m, COUNTED))
+    if n_pit != outside:
+        raise RuntimeError(f"{outside} conv/linear layers outside the fx leaves but {n_pit} PIT "
+                           f"layers: some layer is neither prunable nor in the fixed part, so the "
+                           f"real cost would be wrong")
     feeding = pit_layers_feeding(pit, LEAVES)
     freeze_output_channels(pit, feeding, verbose=verbose)
-    converted, skipped, frozen = apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
+    apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
+
     wrapper = PITDetectionModel(pit, detect, src)
-    with torch.no_grad():
-        wrapper.cost0 = float(pit.cost)
-    wrapper.pit_meta = dict(model=str(model), n=n, remainder=remainder, cost=cost,
-                            trace_imgsz=trace_imgsz, cost0=wrapper.cost0)
+    wrapper.cost0 = _pit_costs(pit)
+    min_pit = _pit_costs(pit, minimum=True)
+    wrapper.fixed = fixed
+    wrapper.total0 = {m: wrapper.cost0[m] + fixed[m] for m in COSTS}
+    wrapper.min_total = {m: min_pit[m] + fixed[m] for m in COSTS}
+    costs = {m: dict(total=wrapper.total0[m], pit=wrapper.cost0[m], fixed=fixed[m],
+                     min_total=wrapper.min_total[m], min_pit=min_pit[m]) for m in COSTS}
+    wrapper.pit_meta = dict(model=str(model), n=n, remainder=remainder, trace_imgsz=trace_imgsz,
+                            yolopit=YOLOPIT_VERSION, costs=costs, **info)
+    if verbose:
+        LOGGER.info(cost_table(wrapper))
     return wrapper
 
 
+def cost_table(model: PITDetectionModel) -> str:
+    """Initial costs of the whole model, how much PIT can act on, and the minimum."""
+    meta = model.pit_meta
+    lines = [f"{colorstr('PIT:')} costs of the whole model at {meta['trace_imgsz']}px "
+             f"(Detect branch {meta['detect_branch']}, N={meta['n']})",
+             f"{'':8s}{'total':>10s}{'prunable':>10s}{'fixed':>10s}{'minimum':>18s}"]
+    for m, c in meta["costs"].items():
+        lines.append(f"{m:8s}{fmt(c['total'], m):>10s}{fmt(c['pit'], m):>10s}"
+                     f"{fmt(c['fixed'], m):>10s}{fmt(c['min_total'], m):>10s} "
+                     f"({100 * c['min_total'] / c['total']:.1f}%)")
+    return "\n".join(lines)
+
+
+def resolve_regularizer(model: PITDetectionModel, reg: dict):
+    """regularizer group -> (StandardRegularizer | DuccioRegularizer, info for the logs/files).
+
+    duccio: targets of the whole model (absolute or % of the input model) are checked against the
+    minimum reachable and converted to the PIT part (target - fixed part)."""
+    if reg["mode"] == "standard":
+        r = StandardRegularizer(reg["lambda"], model.cost0)
+        return r, dict(mode="standard", **{"lambda": dict(reg["lambda"])})
+    n = model.pit_meta["n"]
+    targets_pit, info = {}, {}
+    for m, raw in reg["target"].items():
+        kind, value = _config.parse_amount(raw, f"regularizer.target.{m}")
+        total, minimum, fixed = model.total0[m], model.min_total[m], model.fixed[m]
+        target = value if kind == "abs" else value / 100 * total
+        pct = 100 * target / total
+        if target < minimum * (1 - 1e-9):
+            raise ConfigError(
+                f"regularizer.target.{m} = {raw} ({fmt(target, m)}, {pct:.1f}% of the model) is "
+                f"impossible: the minimum reachable is {fmt(minimum, m)} "
+                f"({100 * minimum / total:.1f}% of the model), with every prunable layer at one "
+                f"block of N={n} channels ({fmt(fixed, m)} are in layers that are not pruned). "
+                f"Note that at the minimum the accuracy can degrade severely: for that "
+                f"architecture it is simpler to prune the network directly and fine-tune it.")
+        if target <= minimum * (1 + 1e-9):
+            LOGGER.warning(f"PIT: regularizer.target.{m} = {raw} is the minimum reachable: every "
+                           f"prunable layer at one block of {n} channels, expect a severe "
+                           f"accuracy loss")
+        if target >= total:
+            LOGGER.warning(f"PIT: regularizer.target.{m} = {raw} ({fmt(target, m)}) is not below "
+                           f"the initial cost ({fmt(total, m)}): DUCCIO will not prune for {m}")
+        targets_pit[m] = target - fixed
+        info[m] = dict(requested=raw, target_total=target, target_fraction=target / total,
+                       target_pit=target - fixed)
+    return DuccioRegularizer(targets_pit), dict(mode="duccio", target=info)
+
+
 def nas_lr_factor(e: int, total: int, lrf: float = 1.0, cos: bool = False, fn=None) -> float:
-    """Multiplier of nas_lr0 at search epoch e (0-based) of `total` search epochs.
+    """Multiplier of nas.lr0 at search epoch e (0-based) of `total` search epochs.
 
     Same formulas as Ultralytics' weights scheduler (trainer._setup_scheduler), from 1 to lrf:
       linear (cos=False): max(1 - e/total, 0) * (1 - lrf) + lrf
@@ -178,11 +291,12 @@ def nas_lr_factor(e: int, total: int, lrf: float = 1.0, cos: bool = False, fn=No
 
 # ============================================================================ search trainer
 class PITSearchTrainer(DetectionTrainer):
-    """DetectionTrainer running the PIT search on an FxDetectionModel.
+    """DetectionTrainer running the PIT search on a PITDetectionModel.
 
     Extra settings are class attributes (Ultralytics validates the `overrides` keys):
-      PIT_MODEL, WARMUP_EPOCHS (PIT warmup: masks frozen), LAM, NAS_OPTIMIZER, NAS_LR (lr0 of
-      the masks), NAS_LRF, NAS_COS_LR, NAS_LR_LAMBDA, NAS_WEIGHT_DECAY.
+      PIT_MODEL, WARMUP_EPOCHS (PIT warmup: masks frozen), EMA, NAS_OPTIMIZER, NAS_LR (lr0 of
+      the masks), NAS_LRF, NAS_COS_LR, NAS_LR_LAMBDA, NAS_WEIGHT_DECAY. The cost term is the
+      model's `regularizer`.
 
     Masks vs weights:
       - the masks have their OWN optimizer and their OWN scheduler (nas_lr_factor: linear or
@@ -190,11 +304,13 @@ class PITSearchTrainer(DetectionTrainer):
         Ultralytics; NAS_LRF=1 -> constant), completely separate from the model's: Ultralytics'
         LR warmup, momentum warmup, LR scheduler and gradient clipping act only on the weights;
       - the mask optimizer steps only in the search phase (epoch >= WARMUP_EPOCHS);
-      - AMP is always disabled (mask gradients need full precision)."""
+      - AMP is always disabled (mask gradients need full precision);
+      - EMA=False (default): the EMA model is kept, since Ultralytics validates and saves it, but
+        as an exact copy of the current weights (decay 0)."""
 
     PIT_MODEL: PITDetectionModel | None = None
     WARMUP_EPOCHS = 0
-    LAM = 1.0
+    EMA = False
     NAS_LR = 0.01               # lr0 of the masks
     NAS_LRF = 1.0               # final lr = NAS_LR * NAS_LRF (1.0 -> constant)
     NAS_COS_LR = False          # cosine instead of linear
@@ -223,13 +339,22 @@ class PITSearchTrainer(DetectionTrainer):
         self.model = enable_grads(self.PIT_MODEL)
         return None
 
+    def _setup_train(self):
+        super()._setup_train()
+        if not self.EMA and self.ema is not None:
+            self.ema.decay = lambda updates: 0.0
+            LOGGER.info(f"{colorstr('PIT:')} EMA off during the search (the validated and saved "
+                        f"model is the current one, not an average of past architectures)")
+
     # --- phases
     @staticmethod
     def _on_epoch_start(trainer):
         model = unwrap_model(trainer.model)
         trainer.search_phase = trainer.epoch >= trainer.WARMUP_EPOCHS
         model.net.train_features = trainer.search_phase
-        model.lam = trainer.LAM if trainer.search_phase else 0.0
+        model.search_active = trainer.search_phase
+        model.reg_epoch = max(trainer.epoch - trainer.WARMUP_EPOCHS, 0)
+        model.reg_epochs = max(trainer.epochs - trainer.WARMUP_EPOCHS, 1)
         if trainer.search_phase and trainer.nas_optimizer is not None:
             lr = trainer.NAS_LR * trainer.nas_lr_factor(trainer.epoch)
             for g in trainer.nas_optimizer.param_groups:
@@ -275,7 +400,7 @@ class PITSearchTrainer(DetectionTrainer):
         n_w = sum(len(g["params"]) for g in optimizer.param_groups)
         LOGGER.info(f"{colorstr('PIT:')} the line above counts the masks too: after removing them "
                     f"the weights optimizer ({type(optimizer).__name__}) has {n_w} parameters")
-        sched = ("custom (nas_lr_lambda)" if self.NAS_LR_LAMBDA is not None else
+        sched = ("custom (lr_lambda)" if self.NAS_LR_LAMBDA is not None else
                  "constant" if self.NAS_LRF == 1.0 else
                  f"{'cosine' if self.NAS_COS_LR else 'linear'} {self.NAS_LR} -> "
                  f"{self.NAS_LR * self.NAS_LRF:g}")
@@ -283,6 +408,9 @@ class PITSearchTrainer(DetectionTrainer):
                     f"(lr0={self.NAS_LR}, weight_decay={self.NAS_WEIGHT_DECAY}), scheduler "
                     f"{sched} over the search epochs, {len(nas)} mask parameters (separate from "
                     f"the weights: no Ultralytics LR warmup/scheduler/grad clipping)")
+        reg = unwrap_model(model).regularizer
+        if reg is not None:
+            LOGGER.info(f"{colorstr('PIT:')} cost term: {reg.describe()}")
         return optimizer
 
     def optimizer_step(self):
@@ -309,9 +437,10 @@ class PITSearchTrainer(DetectionTrainer):
     # --- checkpoints through state_dict (PLiNIO models cannot be pickled).
     #     In a pruning search the highest-mAP epoch is (almost) always the LEAST pruned one, so
     #     "best by fitness" is meaningless: best.pt always follows the latest epoch (the current
-    #     architecture). mAP/cost of every epoch are in results.csv to pick another one by hand.
+    #     architecture). mAP/costs of every epoch are in results.csv to pick another one by hand.
     def save_model(self):
         ema = self.ema.ema
+        reg = unwrap_model(self.model).regularizer   # the EMA copy holds a copy that never runs
         ckpt = {
             "epoch": self.epoch,
             "best_fitness": self.best_fitness,
@@ -320,8 +449,11 @@ class PITSearchTrainer(DetectionTrainer):
             "train_args": vars(self.args),
             "train_metrics": {**self.metrics, "fitness": self.fitness},
             "channels": ema.channel_report(),
+            "costs": {m: float(v) for m, v in ema.real_costs().items()},
+            "duccio_strengths": reg.strengths() if isinstance(reg, DuccioRegularizer) else None,
             "nas_optimizer": self.nas_optimizer.state_dict() if self.nas_optimizer else None,
             "version": ULTRALYTICS_VERSION,
+            "yolopit": YOLOPIT_VERSION,
         }
         self.wdir.mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, self.last)
@@ -351,10 +483,12 @@ class PITSearchTrainer(DetectionTrainer):
 
     @staticmethod
     def _on_train_end(trainer):
-        rows = unwrap_model(trainer.ema.ema).channel_report()
+        model = unwrap_model(trainer.ema.ema)
+        rows = model.channel_report()
         if not rows:
             return
-        path = Path(trainer.save_dir) / "channels.csv"
+        save_dir = Path(trainer.save_dir)
+        path = save_dir / "channels.csv"
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["layer", "channels", "kept", "prunable"])
@@ -368,6 +502,17 @@ class PITSearchTrainer(DetectionTrainer):
         for name, c, k, prunable in rows:
             if prunable and k != c:
                 LOGGER.info(f"{name:32s}{c:10d}{k:8d}")
+        summary = search_summary(model, trainer,
+                                 regularizer=unwrap_model(trainer.model).regularizer)
+        (save_dir / "pit_summary.json").write_text(json.dumps(summary, indent=1))
+        LOGGER.info(f"{colorstr('PIT:')} whole model, initial -> final (minimum reachable):")
+        for m, c in summary["costs"].items():
+            line = (f"  {m:7s}{fmt(c['initial'], m):>10s} -> {fmt(c['final'], m):>9s} "
+                    f"({100 * c['final_fraction']:.1f}%)   min {fmt(c['min'], m)}")
+            if "target" in c:
+                line += (f"   target {fmt(c['target'], m)}: "
+                         f"{'met' if c['target_met'] else 'NOT met'}")
+            LOGGER.info(line)
         try:
             out = plot_pit_results(trainer.save_dir, rows)
             if out:
@@ -376,82 +521,119 @@ class PITSearchTrainer(DetectionTrainer):
             LOGGER.warning(f"PIT: pit_results.png not created ({e})")
 
 
+def search_summary(model: PITDetectionModel, trainer=None, regularizer=None) -> dict:
+    """pit_summary.json: costs initial/final/minimum (and targets), channels, versions."""
+    final = {m: float(v) for m, v in model.real_costs().items()}
+    reg_info = getattr(model, "regularizer_info", {}) or {}
+    costs = {}
+    for m in final:
+        c = dict(initial=model.total0[m], final=final[m], final_fraction=final[m] / model.total0[m],
+                 min=model.min_total[m], fixed=model.fixed[m])
+        t = (reg_info.get("target") or {}).get(m)
+        if t:
+            c.update(target=t["target_total"], target_met=final[m] <= t["target_total"] * (1 + 1e-6))
+        costs[m] = c
+    rows = model.channel_report()
+    out = dict(yolopit=YOLOPIT_VERSION, ultralytics=ULTRALYTICS_VERSION,
+               model=model.pit_meta.get("model"), n=model.pit_meta.get("n"),
+               remainder=model.pit_meta.get("remainder"), imgsz=model.pit_meta.get("trace_imgsz"),
+               detect_branch=model.pit_meta.get("detect_branch"), regularizer=reg_info,
+               costs=costs,
+               prunable_channels=dict(before=sum(r[1] for r in rows if r[3]),
+                                      kept=sum(r[2] for r in rows if r[3])))
+    regularizer = regularizer if regularizer is not None else model.regularizer
+    if isinstance(regularizer, DuccioRegularizer):
+        out["duccio_strengths"] = regularizer.strengths()
+    if trainer is not None:
+        out["epochs"] = trainer.epochs
+        out["metrics"] = {k: float(v) for k, v in (trainer.metrics or {}).items()
+                          if isinstance(v, (int, float))}
+    return out
+
+
 # ============================================================================ user-facing API
 class PITYOLO:
-    """Ultralytics-like entry point for the PIT channel search."""
+    """Ultralytics-like entry point for the PIT channel search.
 
-    def __init__(self, model="yolo26n.pt", n=8, remainder=True, cost="ops", trace_imgsz=320):
-        self.model = build_pit_model(model, n=n, remainder=remainder, cost=cost,
-                                     trace_imgsz=trace_imgsz)
+    PITYOLO(model, cfg=None, n=None, remainder=None, trace_imgsz=None)
+      model: YOLO26 weights already trained on your data (or a yaml).
+      cfg: search config (YAML path or dict, see yolopit.config): Ultralytics arguments plus the
+           groups `pit`, `nas`, `regularizer`. The `pit` group (n, remainder, trace_imgsz) fixes
+           the search space, so it is used here; explicit arguments override it.
+      trace_imgsz: image size at which the costs are computed; default: pit.trace_imgsz, else
+           the config's imgsz, else 640. Absolute targets refer to this size.
+    """
+
+    def __init__(self, model="yolo26n.pt", cfg=None, n=None, remainder=None, trace_imgsz=None,
+                 cost=None):
+        self._legacy_cost = cost or "ops"   # only for the old flat key `lam`
+        self._conf = _config.load(cfg)
+        ultra, groups = _config.split(self._conf, self._legacy_cost)
+        pit = groups["pit"]
+        for k, v in dict(n=n, remainder=remainder, trace_imgsz=trace_imgsz).items():
+            if v is not None:
+                pit[k] = v
+        if pit["trace_imgsz"] is None:
+            pit["trace_imgsz"] = int(ultra.get("imgsz", 640))
+        self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz")}
+        self.model = build_pit_model(model, n=int(pit["n"]), remainder=bool(pit["remainder"]),
+                                     trace_imgsz=int(pit["trace_imgsz"]))
         self.trainer = None
-
-    # PIT-specific settings (everything else goes to Ultralytics) and their defaults
-    PIT_DEFAULTS = dict(pit_warmup_epochs=0, lam=1.0, nas_optimizer="AdamW", nas_lr0=0.01,
-                        nas_lrf=1.0, nas_cos_lr=False, nas_weight_decay=0.0, nas_lr_lambda=None)
 
     def train(self, cfg=None, **kwargs):
         """Run the search.
 
-        cfg: optional YAML file with Ultralytics train arguments AND the PIT settings below, all at
-            top level, e.g.
-                data: aod4.yaml
-                epochs: 100
-                lr0: 0.001          # weights (Ultralytics scheduler: lrf, cos_lr)
-                lrf: 0.01
-                lam: 1.0            # PIT
-                nas_lr0: 0.01
-                nas_lrf: 0.01
-                nas_cos_lr: true
-            Keyword arguments override the YAML.
+        cfg: search config (YAML path or dict); default: the one given to PITYOLO(). Keyword
+        arguments override it: Ultralytics arguments, whole groups (nas={"lr0": 0.05}) or the old
+        flat keys (lam, nas_lr0, ...). nas.lr_lambda (fn(search_epoch, search_epochs) -> factor
+        of nas.lr0) can only be given from Python.
 
-        PIT settings:
-          pit_warmup_epochs: epochs with frozen masks (weights only) before the search starts.
-          lam: weight of the cost term (cost = fraction of the initial cost, per image).
-          nas_optimizer: "AdamW" (default), "Adam" or "SGD" (momentum 0.9).
-          nas_lr0, nas_lrf, nas_cos_lr: masks scheduler, same formulas as Ultralytics' lr0/lrf/
-              cos_lr, over the SEARCH epochs (epochs - pit_warmup_epochs), stepped per epoch.
-              nas_lrf=1.0 (default) -> constant lr. `nas_lr` is accepted as alias of nas_lr0.
-          nas_lr_lambda: (Python only, not from YAML) fn(search_epoch, search_epochs) -> factor
-              of nas_lr0, replaces linear/cosine.
-          nas_weight_decay: masks weight decay (default 0).
-
-        Defaults follow the workflow "model already fine-tuned on the data -> search -> fine-tune":
-        weights optimizer SGD (Ultralytics momentum), no LR warmup, no PIT warmup, AMP always off.
-        Warnings are printed if a warmup is enabled. Other arguments are standard Ultralytics train
-        arguments (imgsz, batch, device, optimizer, lr0, lrf, cos_lr, ...)."""
+        Defaults follow the workflow "model already trained on the data -> search -> fine-tune":
+        weights optimizer SGD, no LR warmup, no PIT warmup, AMP off, EMA off, masks AdamW with
+        constant lr, cost term standard with lambda {ops: 1.0}."""
         import yaml
-        conf = {}
-        if cfg is not None:
-            conf = yaml.safe_load(Path(cfg).read_text()) or {}
-            if "names" in conf and "data" not in conf:
-                raise ValueError(f"{cfg} looks like a DATASET yaml (it has 'names'): the first "
-                                 f"argument of train() is the training config. Use "
-                                 f"train(data='{cfg}', ...) or put 'data: {cfg}' in the config")
-            if "nas_lr_lambda" in conf:
-                raise ValueError("nas_lr_lambda cannot be set from YAML (Python callable only)")
-        conf.update(kwargs)
-        if "nas_lr" in conf:                              # alias
-            conf.setdefault("nas_lr0", conf.pop("nas_lr"))
-        pit = {k: conf.pop(k, v) for k, v in self.PIT_DEFAULTS.items()}
-        if "data" not in conf:
-            raise ValueError("'data' is required (in the YAML or as keyword argument)")
-        conf.setdefault("epochs", 100)
-        conf.setdefault("project", "pit")   # Ultralytics: runs/detect/pit/<name>
-        conf.setdefault("name", "search")
+        base = _config.load(cfg) if cfg is not None else copy.deepcopy(self._conf)
+        conf = _config.merge(_config.normalize(base, self._legacy_cost),
+                             _config.normalize(kwargs, self._legacy_cost))
+        ultra, groups = _config.split(conf, self._legacy_cost)
+        given_pit = conf.get("pit") or {}
+        for k, built in self.arch.items():
+            if given_pit.get(k) is not None and given_pit[k] != built:
+                raise ConfigError(f"pit.{k} = {given_pit[k]} but the model was built with "
+                                  f"{built}: pit.{k} is fixed when the model is built, pass it to "
+                                  f"PITYOLO(...)")
+        if "data" not in ultra:
+            raise ConfigError("'data' is required (in the config or as keyword argument)")
+        imgsz = ultra.get("imgsz")
+        if imgsz is not None and int(imgsz) != int(self.arch["trace_imgsz"]):
+            LOGGER.warning(f"PIT: training at imgsz={imgsz} but costs computed at "
+                           f"{self.arch['trace_imgsz']}px (pit.trace_imgsz): absolute costs and "
+                           f"targets refer to {self.arch['trace_imgsz']}px")
+        ultra.setdefault("epochs", 100)
+        ultra.setdefault("project", "pit")   # Ultralytics: runs/detect/pit/<name>
+        ultra.setdefault("name", "search")
+
+        regularizer, reg_info = resolve_regularizer(self.model, groups["regularizer"])
+        self.model.regularizer, self.model.regularizer_info = regularizer, reg_info
+        nas, pit = groups["nas"], groups["pit"]
+        lr_lambda = nas["lr_lambda"]
         trainer_cls = type("PITSearchTrainerRun", (PITSearchTrainer,), dict(
-            PIT_MODEL=self.model, WARMUP_EPOCHS=pit["pit_warmup_epochs"], LAM=pit["lam"],
-            NAS_OPTIMIZER=pit["nas_optimizer"], NAS_LR=pit["nas_lr0"], NAS_LRF=pit["nas_lrf"],
-            NAS_COS_LR=bool(pit["nas_cos_lr"]),
+            PIT_MODEL=self.model, WARMUP_EPOCHS=int(pit["warmup_epochs"]), EMA=bool(pit["ema"]),
+            NAS_OPTIMIZER=nas["optimizer"], NAS_LR=float(nas["lr0"]), NAS_LRF=float(nas["lrf"]),
+            NAS_COS_LR=bool(nas["cos_lr"]),
             # staticmethod: a plain function stored on the class would be bound (self as arg 1)
-            NAS_LR_LAMBDA=(staticmethod(pit["nas_lr_lambda"]) if pit["nas_lr_lambda"] else None),
-            NAS_WEIGHT_DECAY=pit["nas_weight_decay"]))
-        conf["model"] = self.model.pit_meta["model"]
-        self.trainer = trainer_cls(overrides=conf)
+            NAS_LR_LAMBDA=staticmethod(lr_lambda) if lr_lambda else None,
+            NAS_WEIGHT_DECAY=float(nas["weight_decay"])))
+        ultra["model"] = self.model.pit_meta["model"]
+        self.trainer = trainer_cls(overrides=ultra)
         save_dir = Path(self.trainer.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        pit_saved = {k: (v if k != "nas_lr_lambda" else (None if v is None else repr(v)))
-                     for k, v in pit.items()}
-        (save_dir / "pit_args.yaml").write_text(yaml.safe_dump(pit_saved, sort_keys=False))
+        saved = dict(yolopit=YOLOPIT_VERSION, pit={**pit, **self.arch},
+                     nas={**nas, "lr_lambda": None if lr_lambda is None else repr(lr_lambda)},
+                     regularizer=groups["regularizer"], resolved=reg_info,
+                     costs=self.model.pit_meta["costs"],
+                     detect_branch=self.model.pit_meta["detect_branch"])
+        (save_dir / "pit_args.yaml").write_text(yaml.safe_dump(_plain(saved), sort_keys=False))
         self.trainer.train()
         self.model = unwrap_model(self.trainer.ema.ema)   # final search weights (final_eval)
         return self.trainer.metrics
@@ -470,19 +652,36 @@ class PITYOLO:
         restore_exported_bn(pit, exported, verbose=False)
         detect = next(m for m in exported.modules() if isinstance(m, Detect))
         pruned = FxDetectionModel(exported, detect, wrapper).eval()
-        pruned.pit_meta = {**wrapper.pit_meta, "channels": wrapper.channel_report()}
+        pruned.pit_meta = {**wrapper.pit_meta, "channels": wrapper.channel_report(),
+                           "final_costs": {m: float(v) for m, v in wrapper.real_costs().items()}}
         if path is None:
             base = Path(self.trainer.save_dir) if self.trainer else Path("runs/pit")
             path = base / "weights" / "pruned.pt"
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         train_args = vars(self.trainer.args) if self.trainer else {}
-        torch.save({"model": None, "ema": copy.deepcopy(pruned).half(), "epoch": -1,
+        # fp32, not half like Ultralytics' own checkpoints: the pruned model must give exactly
+        # the results of the end of the search (fp16 rounding moves boxes by up to ~1 px)
+        torch.save({"model": None, "ema": copy.deepcopy(pruned).float(), "epoch": -1,
                     "train_args": train_args, "version": ULTRALYTICS_VERSION,
-                    "pit_meta": pruned.pit_meta}, path)
+                    "yolopit": YOLOPIT_VERSION, "pit_meta": pruned.pit_meta}, path)
         n_before = sum(p.numel() for p in wrapper.parameters()) - sum(
             p.numel() for p in pit.nas_parameters())
         n_after = sum(p.numel() for p in pruned.parameters())
         LOGGER.info(f"{colorstr('PIT:')} pruned model saved to {path} "
                     f"(params {n_before:,} -> {n_after:,})")
         return YOLO(str(path))
+
+
+def _plain(x):
+    """YAML-safe copy (tuples -> lists, numpy/torch scalars -> float)."""
+    if isinstance(x, dict):
+        return {str(k): _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_plain(v) for v in x]
+    if isinstance(x, (str, bool, int, float)) or x is None:
+        return x
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return str(x)

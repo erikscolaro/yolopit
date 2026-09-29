@@ -14,3 +14,7 @@ def test_optimizer_separation(script):
 
 def test_nas_scheduler(script):
     script("nas_scheduler.py")
+
+
+def test_regularizers_and_ema(script):
+    script("regularizers.py")

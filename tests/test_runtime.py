@@ -54,3 +54,29 @@ def test_legacy_names():
 
     assert pit_yolo.PITYOLO is yolopit.search.PITYOLO
     assert pit_block_masks.apply_block_masks is yolopit.masks.apply_block_masks
+
+
+def test_pruned_checkpoint_is_exact(tmp_path):
+    """pruned.pt gives the same outputs as the search model (fp32 checkpoint, BN restored)."""
+    from ultralytics import YOLO
+    from yolopit import PITYOLO
+    from yolopit.masks import PITBlockFeaturesMasker
+
+    s = PITYOLO("yolo26n.pt", n=16, trace_imgsz=160)
+    with torch.no_grad():
+        for l in s.model.net.seed.modules():
+            m = getattr(l, "out_features_masker", None)
+            if isinstance(m, PITBlockFeaturesMasker) and len(m.sizes) > 1:
+                m.block[0] = 0.0                      # prune one block in every layer
+    s.export_pruned(path=tmp_path / "pruned.pt")
+    p = YOLO(str(tmp_path / "pruned.pt")).model.eval()
+    sm = s.model.float().eval()
+    sm.model[-1].export = p.model[-1].export = True
+    x = torch.rand(1, 3, 160, 160)
+    with torch.no_grad():
+        a, b = sm(x), p(x)
+    a = a[0] if isinstance(a, (list, tuple)) else a
+    b = b[0] if isinstance(b, (list, tuple)) else b
+    assert next(p.parameters()).dtype == torch.float32
+    # outputs are box coordinates in pixels: fp32 rounding only (fp16 would give ~1 px)
+    assert (a - b).abs().max().item() < 1e-3

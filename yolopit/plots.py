@@ -27,11 +27,12 @@ def plot_pit_results(save_dir, channel_rows=None):
                       [x for x, v in zip(col(k), validated) if v]) if col(k) else None
     fig, ax = plt.subplots(2, 2, figsize=(13, 8))
     a = ax[0, 0]
-    if col("train/cost"):
-        a.plot(ep, col("train/cost"), marker=".", label="train")
-    if vcol("val/cost"):
-        a.plot(*vcol("val/cost"), marker="o", label="val")
-    a.set_title("cost of the current architecture / initial cost")
+    metrics = [m for m in ("ops", "params") if col(f"train/{m}")] or (
+        ["cost"] if col("train/cost") else [])      # "cost": runs made before yolopit 0.2
+    for m in metrics:
+        a.plot(ep, col(f"train/{m}"), marker=".", label=m if m != "cost" else "train")
+    a.set_title("cost of the whole model / initial (current architecture)"
+                if metrics != ["cost"] else "cost of the current architecture / initial cost")
     a.set_ylim(0, 1.05); a.legend(); a.grid(alpha=.3)
     a = ax[0, 1]
     for k, lab in (("metrics/mAP50-95(B)", "mAP50-95"), ("metrics/mAP50(B)", "mAP50")):

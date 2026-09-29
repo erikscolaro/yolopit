@@ -33,7 +33,7 @@ def check(cond, msg):
 
 
 # --- 1) build + hand-set masks: one block off in the first prunable masker with >= 4 blocks
-search = PITYOLO("yolo26n.pt", n=N, cost="ops", trace_imgsz=320)
+search = PITYOLO("yolo26n.pt", n=N, trace_imgsz=320)
 wrapper = search.model
 maskers = {id(l.out_features_masker): l.out_features_masker
            for l in wrapper.net.seed.modules() if hasattr(l, "out_features_masker")
@@ -44,7 +44,7 @@ with torch.no_grad():
 hand = {id(m): m.block.detach().clone() for m in maskers.values()}
 rows = wrapper.channel_report()
 expected = {name: kept for name, _, kept, _ in rows}
-real_cost = float(wrapper.real_cost_fraction())
+real_cost = float(wrapper.real_costs(fraction=True)["ops"])
 print(f"hand-set masks: real cost {real_cost:.3f} of the original, "
       f"prunable channels {sum(r[1] for r in rows if r[3])} -> {sum(r[2] for r in rows if r[3])}")
 check(real_cost < 1.0, f"real cost fraction dropped ({real_cost:.3f})")

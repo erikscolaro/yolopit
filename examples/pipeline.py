@@ -29,7 +29,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="yolo26n.pt")
 ap.add_argument("--data", default="coco8.yaml")
 ap.add_argument("--n", type=int, default=4)
-ap.add_argument("--cost", default="ops")
+ap.add_argument("--cost", default="ops", choices=["ops", "params"], help="cost weighted by --lam")
 ap.add_argument("--epochs", type=int, default=20)
 ap.add_argument("--ft-epochs", type=int, default=10)
 ap.add_argument("--lam", type=float, default=1.0)
@@ -64,10 +64,11 @@ ref = YOLO(a.model).val(data=a.data, name="val_input_model", plots=False, **comm
 summary["map_input_model"] = ref.box.map
 
 # --- search
-search = PITYOLO(a.model, n=a.n, cost=a.cost, trace_imgsz=a.imgsz)
-tr_metrics = search.train(data=a.data, epochs=a.epochs, lam=a.lam, nas_lr0=a.nas_lr,
-                          nas_lrf=a.nas_lrf, nas_cos_lr=a.nas_cos_lr, lr0=a.lr0, lrf=a.lrf,
-                          nbs=a.nbs, name="search", plots=True, **common)
+search = PITYOLO(a.model, n=a.n, trace_imgsz=a.imgsz)
+tr_metrics = search.train(data=a.data, epochs=a.epochs, lr0=a.lr0, lrf=a.lrf, nbs=a.nbs,
+                          nas=dict(lr0=a.nas_lr, lrf=a.nas_lrf, cos_lr=a.nas_cos_lr),
+                          regularizer=dict(mode="standard", **{"lambda": {a.cost: a.lam}}),
+                          name="search", plots=True, **common)
 tr = search.trainer
 summary["map_search_final"] = tr_metrics["metrics/mAP50-95(B)"]
 w_ids = {id(p) for g in tr.optimizer.param_groups for p in g["params"]}
@@ -79,13 +80,13 @@ rows = search.model.channel_report()
 before = sum(r[1] for r in rows if r[3])
 kept = sum(r[2] for r in rows if r[3])
 summary["prunable_channels"] = [before, kept]
-summary["real_cost_fraction"] = float(search.model.real_cost_fraction())
+summary["real_cost_fraction"] = {k: float(v) for k, v in search.model.real_costs(fraction=True).items()}
 check(all(r[2] % a.n == 0 or r[2] == r[1] for r in rows if r[3]),
       f"every prunable layer keeps a multiple of N={a.n} channels (or all of them)")
 with open(root / "search" / "results.csv") as f:
     res = [{k.strip(): v for k, v in r.items()} for r in csv.DictReader(f)]
 summary["search_curve"] = [
-    dict(epoch=int(float(r["epoch"])), cost=float(r["train/cost"]),
+    dict(epoch=int(float(r["epoch"])), ops=float(r["train/ops"]), params=float(r["train/params"]),
          map50_95=float(r["metrics/mAP50-95(B)"]), lr_weights=float(r["lr/pg0"]),
          lr_masks=float(r["lr/masks"])) for r in res]
 from yolopit import nas_lr_factor
@@ -146,7 +147,7 @@ print(f"\nSUMMARY {name}: mAP50-95 input {summary['map_input_model']:.4f} | end 
       f"{summary['map_search_final']:.4f} | after export {summary['map_after_export']:.4f} | "
       f"after fine-tuning {summary['map_after_finetune']:.4f}")
 print(f"SUMMARY {name}: prunable channels {before} -> {kept}, real cost "
-      f"{summary['real_cost_fraction']:.3f}, params {p_in:,} -> {p_out:,}, "
+      f"{summary['real_cost_fraction']['ops']:.3f} (ops), params {p_in:,} -> {p_out:,}, "
       f"{summary['minutes']} min")
 print("ALL CHECKS PASSED" if all(c[0] for c in checks) else
       f"{sum(not c[0] for c in checks)} CHECK(S) FAILED")

@@ -19,6 +19,7 @@ import torch
 
 import yolopit.search as pit_yolo
 from yolopit._common import apply_pit_defaults
+from yolopit.regularizers import StandardRegularizer
 from yolopit import PITSearchTrainer, PITYOLO
 from ultralytics.utils.torch_utils import unwrap_model
 
@@ -97,9 +98,10 @@ class CheckedTrainer(PITSearchTrainer):
 def run(label, **overrides):
     print(f"\n=== {label} ===", flush=True)
     _clip_calls.clear()
-    s = PITYOLO("yolo26n.pt", n=4, cost="ops", trace_imgsz=320)
+    s = PITYOLO("yolo26n.pt", n=4, trace_imgsz=320)
+    s.model.regularizer = StandardRegularizer({"ops": 2.0}, s.model.cost0)
     cls = type("CheckedRun", (CheckedTrainer,), dict(
-        PIT_MODEL=s.model, WARMUP_EPOCHS=1, LAM=2.0, NAS_LR=0.01, NAS_WEIGHT_DECAY=0.0,
+        PIT_MODEL=s.model, WARMUP_EPOCHS=1, NAS_LR=0.01, NAS_WEIGHT_DECAY=0.0,
         NAS_OPTIMIZER="AdamW"))
     args = dict(model="yolo26n.pt", data="coco8.yaml", epochs=4, imgsz=320, batch=4, workers=0,
                 device="cpu", nbs=4, project=str(OUT), name=label, exist_ok=True, plots=False,
