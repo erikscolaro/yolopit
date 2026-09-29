@@ -7,25 +7,28 @@ name = "yolopit"
 version = "0.1.0"
 description = "Structured channel pruning of Ultralytics YOLO26 with PLiNIO PIT, in blocks of N channels"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.14"   # tested on 3.11 and 3.13
 authors = [{name = "Erik Scolaro"}]
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-# Versions are pinned in step 3 (see README, "Versions").
+# Exact versions: yolopit patches internals of Ultralytics and PLiNIO, so only the tested
+# combination is allowed. torch < 2.13 and numpy < 2.3 are the limits of the Axelera SDK used by
+# yoloeval. requirements-lock.txt has the whole tested environment.
 dependencies = [
-    "torch",
-    "ultralytics",
-    "pyyaml",
-    "matplotlib",
-    # yolopit patches PLiNIO internals: keep this exact commit. PLiNIO's setup.py does not
-    # declare its own requirements, so the ones PIT imports are listed here.
-    "networkx",
-    "tdigest",
+    "torch==2.12.1",
+    "torchvision==0.27.1",
+    "ultralytics==8.4.165",
+    "numpy==2.2.6",
+    "pyyaml==6.0.3",
+    "matplotlib==3.10.9",
+    # PLiNIO's setup.py does not declare its own requirements: the ones PIT imports are here
+    "networkx==3.6.1",
+    "tdigest==0.5.2.2",
     "plinio @ git+https://github.com/eml-eda/plinio.git@3d6b5e08b3c7d861620ecc9ab25bff82852f8c7c",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "onnx", "onnxruntime"]
+test = ["pytest==9.1.1", "onnx==1.23.1", "onnxruntime==1.30.0"]
 
 [tool.setuptools]
 packages = ["yolopit"]

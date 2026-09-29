@@ -19,6 +19,26 @@ Loading and running a pruned model does not import it: pruned checkpoints only n
 
 For development: `pip install -e ".[test]"`.
 
+### Versions
+
+All dependencies are pinned, because yolopit patches internals of Ultralytics and PLiNIO:
+
+| | version |
+|---|---|
+| Python | 3.11 – 3.13 (tested on 3.11 and 3.13) |
+| torch / torchvision | 2.12.1 / 0.27.1 (PyPI default build, CUDA 13.0) |
+| ultralytics | 8.4.165 |
+| numpy | 2.2.6 |
+| PLiNIO | commit `3d6b5e0` |
+
+torch < 2.13 and numpy < 2.3 match the limits of the Axelera SDK used by
+[yoloeval](https://github.com/erikscolaro/yoloeval). For a different CUDA version, first install
+the same torch/torchvision versions built for your CUDA from the PyTorch index (see
+https://pytorch.org/get-started/previous-versions/), then yolopit.
+
+`requirements-lock.txt` is the whole environment the tests passed in: use it in a clean venv
+(`pip install -r requirements-lock.txt && pip install --no-deps -e .`) to reproduce it exactly.
+
 ## Use
 
 ```python
