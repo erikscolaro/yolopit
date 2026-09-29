@@ -1,0 +1,27 @@
+# Example PIT search config: Ultralytics train arguments + PIT settings, all at top level.
+# Usage:  PITYOLO("modello_finetunato.pt", n=16, cost="ops").train(cfg="examples/search.yaml")
+# Keyword arguments passed to train() override these values.
+
+# --- Ultralytics (weights) -------------------------------------------------------------
+data: coco128.yaml        # dataset yaml (es. /content/drive/MyDrive/aod4/data.yaml)
+epochs: 100
+imgsz: 640
+batch: 16
+device: 0                 # "cpu" or GPU index
+optimizer: SGD            # any Ultralytics optimizer, also "auto": the masks never enter it
+lr0: 0.001                # weights scheduler: Ultralytics' own (linear, or cosine with cos_lr)
+lrf: 0.01
+cos_lr: false
+warmup_epochs: 0          # input model already trained on the data: no LR warmup (warning if > 0)
+project: /content/pit_runs  # su Colab: meglio un percorso su Drive
+name: search
+
+# --- PIT -------------------------------------------------------------------------------
+pit_warmup_epochs: 0      # epochs with frozen masks before the search (warning if > 0)
+lam: 1.0                  # weight of the cost term (cost = fraction of the initial cost)
+nas_optimizer: AdamW      # AdamW | Adam | SGD (momentum 0.9)
+nas_lr0: 0.01             # masks scheduler: same formulas as lr0/lrf/cos_lr, over the SEARCH
+nas_lrf: 0.01             #   epochs (epochs - pit_warmup_epochs); nas_lrf: 1.0 -> constant
+nas_cos_lr: false         #   true -> cosine instead of linear
+nas_weight_decay: 0.0
+# nas_lr_lambda: only from Python, e.g. train(cfg=..., nas_lr_lambda=lambda e, n: 0.5 ** (e // 10))
