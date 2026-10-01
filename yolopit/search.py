@@ -267,7 +267,10 @@ def resolve_regularizer(model: PITDetectionModel, reg: dict):
         if target >= total:
             LOGGER.warning(f"PIT: regularizer.target.{m} = {raw} ({fmt(target, m)}) is not below "
                            f"the initial cost ({fmt(total, m)}): DUCCIO will not prune for {m}")
-        targets_pit[m] = target - fixed
+        if target < total:
+            # a target not below the initial cost does not push (and DUCCIO would divide by
+            # cost - target = 0): out of the cost term
+            targets_pit[m] = target - fixed
         info[m] = dict(requested=raw, target_total=target, target_fraction=target / total,
                        target_pit=target - fixed)
     return DuccioRegularizer(targets_pit), dict(mode="duccio", target=info)

@@ -53,5 +53,7 @@ class DuccioRegularizer:
         return {k: float(v) for k, v in self._duccio.final_strengths.items()}
 
     def describe(self) -> str:
+        if not self.targets_pit:
+            return "DUCCIO, no target below the initial cost: nothing to prune"
         return "DUCCIO, targets on the PIT part: " + ", ".join(
             f"{m} <= {v:,.0f}" for m, v in self.targets_pit.items())
