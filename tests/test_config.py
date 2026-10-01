@@ -29,7 +29,10 @@ def test_kwargs_override_yaml_across_styles():
 
 def test_duccio_targets():
     _, g = split({"regularizer": {"mode": "duccio", "target": {"ops": "40%", "params": "1.5M"}}})
-    assert g["regularizer"] == {"mode": "duccio", "target": {"ops": "40%", "params": "1.5M"}}
+    assert g["regularizer"] == {"mode": "duccio", "target": {"ops": "40%", "params": "1.5M"},
+                                "margin": 0.05}
+    _, g = split({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "margin": 0.1}})
+    assert g["regularizer"]["margin"] == 0.1
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -50,6 +53,9 @@ def test_parse_amount_errors(value):
     ({"regularizer": {"mode": "duccio", "lambda": {"ops": 1.0}, "target": {"ops": "40%"}}},
      "lambda is for mode"),
     ({"regularizer": {"mode": "duccio"}}, "needs regularizer.target"),
+    ({"regularizer": {"mode": "standard", "margin": 0.05}}, "margin is for mode"),
+    ({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "margin": 1.5}}, r"\[0, 1\)"),
+    ({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "margin": "5%"}}, r"\[0, 1\)"),
     ({"regularizer": {"mode": "other"}}, "mode must be"),
     ({"regularizer": {"lambda": {"latency": 1.0}}}, "unknown cost"),
     ({"regularizer": {"lambda": {"ops": -1}}}, ">= 0"),

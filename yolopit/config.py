@@ -20,6 +20,8 @@
       lambda: {ops: 1.0}        # standard: weight of each cost (fraction of its initial value)
       target: {ops: 40%}        # duccio: budget per cost, absolute (1.2G, 800M, 2e6) or % of the
                                 #   whole input model
+      margin: 0.05              # duccio: best.pt is the best epoch with every cost within
+                                #   target * (1 + margin)
 
 The old flat keys (lam, nas_lr0, pit_warmup_epochs, ...) are still accepted and mapped here.
 """
@@ -40,7 +42,8 @@ DEFAULTS = {
                 lr_lambda=None),
     "regularizer": dict(mode="standard"),
 }
-REG_KEYS = ("mode", "lambda", "target")
+REG_KEYS = ("mode", "lambda", "target", "margin")
+DEFAULT_MARGIN = 0.05
 GROUPS = tuple(DEFAULTS)
 
 # old flat key -> (group, key); "lam" is special (it needs the cost name)
@@ -147,6 +150,9 @@ def _check_regularizer(reg: dict) -> dict:
         if reg.get("target") is not None:
             raise ConfigError("regularizer.target is for mode 'duccio'; mode 'standard' uses "
                               "regularizer.lambda")
+        if reg.get("margin") is not None:
+            raise ConfigError("regularizer.margin is for mode 'duccio': mode 'standard' has no "
+                              "targets, its best.pt is the last epoch")
         lambdas = reg.get("lambda")
         lambdas = {"ops": 1.0} if lambdas is None else lambdas
         if not isinstance(lambdas, dict) or not lambdas:
@@ -167,7 +173,12 @@ def _check_regularizer(reg: dict) -> dict:
     _check_metrics(targets, "regularizer.target")
     for k, v in targets.items():
         parse_amount(v, f"regularizer.target.{k}")
-    return {"mode": mode, "target": dict(targets)}
+    margin = reg.get("margin")
+    margin = DEFAULT_MARGIN if margin is None else margin
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0 <= margin < 1:
+        raise ConfigError(f"regularizer.margin must be a fraction of the target in [0, 1), e.g. "
+                          f"0.05 for 5%, got {margin!r}")
+    return {"mode": mode, "target": dict(targets), "margin": float(margin)}
 
 
 def _check_metrics(d: dict, where: str):

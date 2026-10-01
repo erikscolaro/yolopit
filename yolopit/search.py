@@ -269,11 +269,23 @@ def resolve_regularizer(model: PITDetectionModel, reg: dict):
                            f"the initial cost ({fmt(total, m)}): DUCCIO will not prune for {m}")
         if target < total:
             # a target not below the initial cost does not push (and DUCCIO would divide by
-            # cost - target = 0): out of the cost term
+            # cost - target = 0): out of the cost term, still in the budget of best.pt
             targets_pit[m] = target - fixed
         info[m] = dict(requested=raw, target_total=target, target_fraction=target / total,
                        target_pit=target - fixed)
-    return DuccioRegularizer(targets_pit), dict(mode="duccio", target=info)
+    return DuccioRegularizer(targets_pit), dict(mode="duccio", target=info,
+                                                margin=float(reg.get("margin", 0.0)))
+
+
+def within_budget(costs: dict, reg_info: dict | None) -> bool | None:
+    """Every cost of the whole model within target * (1 + margin)? None without targets
+    (mode standard)."""
+    targets = (reg_info or {}).get("target")
+    if not targets:
+        return None
+    margin = float(reg_info.get("margin", 0.0))
+    return all(float(costs[m]) <= t["target_total"] * (1 + margin) * (1 + 1e-6)
+               for m, t in targets.items())
 
 
 def nas_lr_factor(e: int, total: int, lrf: float = 1.0, cos: bool = False, fn=None) -> float:
@@ -329,6 +341,8 @@ class PITSearchTrainer(DetectionTrainer):
                            f"on the data: normally not needed")
         self.nas_optimizer = None
         self.search_phase = False
+        self.best_within_fitness = None   # best fitness among the epochs within the budget
+        self.best_epoch = None            # epoch saved in best.pt (0-based)
         self.add_callback("on_train_epoch_start", PITSearchTrainer._on_epoch_start)
         self.add_callback("on_train_epoch_end", PITSearchTrainer._on_epoch_end)
         self.add_callback("on_train_end", PITSearchTrainer._on_train_end)
@@ -439,11 +453,34 @@ class PITSearchTrainer(DetectionTrainer):
 
     # --- checkpoints through state_dict (PLiNIO models cannot be pickled).
     #     In a pruning search the highest-mAP epoch is (almost) always the LEAST pruned one, so
-    #     "best by fitness" is meaningless: best.pt always follows the latest epoch (the current
-    #     architecture). mAP/costs of every epoch are in results.csv to pick another one by hand.
+    #     "best by fitness" alone is meaningless. With DUCCIO targets, best.pt is the highest
+    #     fitness among the epochs with every cost within target * (1 + margin), and the latest
+    #     epoch until one is; without targets (mode standard) it is always the latest epoch.
+    def _update_best(self, ok: bool | None) -> bool:
+        """Whether this epoch goes to best.pt; `ok`: costs within the budget (None: no targets)."""
+        if ok is None:
+            self.best_epoch = self.epoch
+            return True
+        if not ok:
+            if self.best_within_fitness is None:     # nothing within the budget yet: latest
+                self.best_epoch = self.epoch
+                return True
+            return False
+        # without validation (val=False) there is no fitness: the latest epoch within the budget
+        fitness = float("-inf") if self.fitness is None else float(self.fitness)
+        if (self.fitness is None or self.best_within_fitness is None
+                or fitness > self.best_within_fitness):
+            self.best_within_fitness, self.best_epoch = fitness, self.epoch
+            return True
+        return False
+
     def save_model(self):
         ema = self.ema.ema
-        reg = unwrap_model(self.model).regularizer   # the EMA copy holds a copy that never runs
+        model = unwrap_model(self.model)
+        reg = model.regularizer   # the EMA copy holds a copy that never runs
+        costs = {m: float(v) for m, v in ema.real_costs().items()}
+        ok = within_budget(costs, getattr(model, "regularizer_info", None))
+        is_best = self._update_best(ok)
         ckpt = {
             "epoch": self.epoch,
             "best_fitness": self.best_fitness,
@@ -452,7 +489,10 @@ class PITSearchTrainer(DetectionTrainer):
             "train_args": vars(self.args),
             "train_metrics": {**self.metrics, "fitness": self.fitness},
             "channels": ema.channel_report(),
-            "costs": {m: float(v) for m, v in ema.real_costs().items()},
+            "costs": costs,
+            "within_budget": ok,
+            "best_epoch": self.best_epoch,
+            "best_within_fitness": self.best_within_fitness,
             "duccio_strengths": reg.strengths() if isinstance(reg, DuccioRegularizer) else None,
             "nas_optimizer": self.nas_optimizer.state_dict() if self.nas_optimizer else None,
             "version": ULTRALYTICS_VERSION,
@@ -460,7 +500,8 @@ class PITSearchTrainer(DetectionTrainer):
         }
         self.wdir.mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, self.last)
-        torch.save(ckpt, self.best)
+        if is_best:
+            torch.save(ckpt, self.best)
         if self.save_period > 0 and self.epoch % self.save_period == 0:
             torch.save(ckpt, self.wdir / f"epoch{self.epoch}.pt")
         return True
@@ -472,10 +513,19 @@ class PITSearchTrainer(DetectionTrainer):
         return False
 
     def final_eval(self):
-        """Validate the final search checkpoint (loaded into the EMA model), with plots."""
-        if self.last.exists():
-            LOGGER.info(f"\nValidating {self.last} (final architecture of the search)...")
-            ckpt = torch.load(self.last, map_location="cpu", weights_only=False)
+        """Validate best.pt (loaded into the EMA model, so it is also what gets exported), with
+        plots."""
+        path = self.best if self.best.exists() else self.last
+        if path.exists():
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            ok = ckpt.get("within_budget")
+            why = ("highest fitness within the budget" if ok else
+                   "latest epoch, no target" if ok is None else
+                   "latest epoch, NO epoch within the budget")
+            LOGGER.info(f"\nValidating {path} (epoch {ckpt['epoch'] + 1}: {why})...")
+            if ok is False:
+                LOGGER.warning("PIT: no epoch had every cost within target * (1 + margin): "
+                               "best.pt is the latest epoch")
             self.ema.ema.load_state_dict(ckpt["pit_state_dict"])
             self.validator.args.plots = self.args.plots
             self.metrics = self.validator(self)
@@ -514,8 +564,12 @@ class PITSearchTrainer(DetectionTrainer):
                     f"({100 * c['final_fraction']:.1f}%)   min {fmt(c['min'], m)}")
             if "target" in c:
                 line += (f"   target {fmt(c['target'], m)}: "
-                         f"{'met' if c['target_met'] else 'NOT met'}")
+                         f"{'met' if c['target_met'] else 'NOT met'}"
+                         f"{'' if c['target_met'] or not c['within_margin'] else ' (within margin)'}")
             LOGGER.info(line)
+        if summary.get("best_epoch") is not None:
+            LOGGER.info(f"{colorstr('PIT:')} best.pt = epoch {summary['best_epoch']} of "
+                        f"{summary['epochs']}, exported as the pruned model")
         try:
             out = plot_pit_results(trainer.save_dir, rows)
             if out:
@@ -534,7 +588,9 @@ def search_summary(model: PITDetectionModel, trainer=None, regularizer=None) -> 
                  min=model.min_total[m], fixed=model.fixed[m])
         t = (reg_info.get("target") or {}).get(m)
         if t:
-            c.update(target=t["target_total"], target_met=final[m] <= t["target_total"] * (1 + 1e-6))
+            c.update(target=t["target_total"], target_met=final[m] <= t["target_total"] * (1 + 1e-6),
+                     within_margin=final[m] <= t["target_total"] * (1 + reg_info.get("margin", 0.0))
+                     * (1 + 1e-6))
         costs[m] = c
     rows = model.channel_report()
     out = dict(yolopit=YOLOPIT_VERSION, ultralytics=ULTRALYTICS_VERSION,
@@ -549,6 +605,8 @@ def search_summary(model: PITDetectionModel, trainer=None, regularizer=None) -> 
         out["duccio_strengths"] = regularizer.strengths()
     if trainer is not None:
         out["epochs"] = trainer.epochs
+        out["best_epoch"] = None if trainer.best_epoch is None else trainer.best_epoch + 1
+        out["best_within_budget"] = within_budget(final, reg_info)
         out["metrics"] = {k: float(v) for k, v in (trainer.metrics or {}).items()
                           if isinstance(v, (int, float))}
     return out
@@ -638,7 +696,7 @@ class PITYOLO:
                      detect_branch=self.model.pit_meta["detect_branch"])
         (save_dir / "pit_args.yaml").write_text(yaml.safe_dump(_plain(saved), sort_keys=False))
         self.trainer.train()
-        self.model = unwrap_model(self.trainer.ema.ema)   # final search weights (final_eval)
+        self.model = unwrap_model(self.trainer.ema.ema)   # best.pt, loaded by final_eval
         return self.trainer.metrics
 
     def load_search_checkpoint(self, path):

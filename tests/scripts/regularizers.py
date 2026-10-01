@@ -63,6 +63,12 @@ t = summary["costs"]["ops"]
 m = s.model
 check(abs(t["target"] - 0.8 * m.total0["ops"]) < 1, f"target 80% of the whole model "
       f"({t['target']:.4g}) in pit_summary.json, met: {t['target_met']}")
+best = torch.load(Path(tr.save_dir) / "weights" / "best.pt", map_location="cpu",
+                  weights_only=False)
+check(summary["regularizer"]["margin"] == 0.05 and "within_margin" in t,
+      f"margin 5% by default, within_margin in pit_summary.json: {t['within_margin']}")
+check(summary["best_epoch"] == best["epoch"] + 1 and best["within_budget"] in (True, False),
+      f"best.pt = epoch {summary['best_epoch']}, within the budget: {best['within_budget']}")
 check(summary["duccio_strengths"].get("ops", 0) > 0, f"DUCCIO strength {summary['duccio_strengths']}")
 saved = yaml.safe_load((Path(tr.save_dir) / "pit_args.yaml").read_text())
 check(saved["resolved"]["target"]["ops"]["target_pit"] ==

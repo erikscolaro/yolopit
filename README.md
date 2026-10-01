@@ -63,7 +63,7 @@ Ultralytics train arguments at top level, plus three groups:
 pit:          {n: 16, remainder: true, trace_imgsz: null, warmup_epochs: 0, ema: false}
 nas:          {optimizer: AdamW, lr0: 0.01, lrf: 1.0, cos_lr: false, weight_decay: 0.0}
 regularizer:  {mode: standard, lambda: {ops: 1.0}}          # or
-regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}}
+regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}, margin: 0.05}
 ```
 
 - `pit` fixes the search space, so `PITYOLO(...)` reads it when it builds the model.
@@ -74,6 +74,11 @@ regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}}
   - `duccio`: a target per cost, absolute (`1.2G`, `800M`, `2e6`) or `%` of the input model.
     Each cost is pushed down only while it is above its target (PLiNIO's DUCCIO). A target
     below the minimum reachable stops with an error that says what the minimum is.
+    `margin` (default `0.05`, i.e. 5%) chooses `best.pt`: the epoch with the highest fitness
+    among those with every cost within `target * (1 + margin)`. Until one is, `best.pt` is the
+    latest epoch (and stays so, with a warning, if none ever is). With `standard` there are no
+    targets and `best.pt` is always the latest epoch.
+- The search validates `best.pt` at the end and exports it as the pruned model.
 - The old flat keys (`lam`, `nas_lr0`, `pit_warmup_epochs`, ...) still work.
 
 ### Costs
