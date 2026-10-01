@@ -569,7 +569,7 @@ class PITSearchTrainer(DetectionTrainer):
             LOGGER.info(f"{colorstr('PIT:')} best.pt = epoch {summary['best_epoch']} of "
                         f"{summary['epochs']}, exported as the pruned model")
         try:
-            out = plot_pit_results(trainer.save_dir, rows)
+            out = plot_pit_results(trainer.save_dir, rows, n=model.pit_meta.get("n"))
             if out:
                 LOGGER.info(f"{colorstr('PIT:')} cost / mAP / learning rates plot: {out}")
         except Exception as e:  # plotting must never break a finished search

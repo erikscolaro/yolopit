@@ -5,12 +5,14 @@ import csv
 from pathlib import Path
 
 
-def plot_pit_results(save_dir, channel_rows=None):
+def plot_pit_results(save_dir, channel_rows=None, n=None):
     """pit_results.png in save_dir: cost (real, train/val), mAP50-95 and mAP50, learning rates of
-    weights and masks (from results.csv), and kept channels per prunable layer."""
+    weights and masks (from results.csv), and kept channels per prunable layer (y grid every N
+    channels, the pruning block, when `n` is given)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
 
     save_dir = Path(save_dir)
     with open(save_dir / "results.csv") as f:
@@ -57,6 +59,12 @@ def plot_pit_results(save_dir, channel_rows=None):
         a.set_title(f"channels per prunable layer ({sum(r[2] for r in pr)}/"
                     f"{sum(r[1] for r in pr)} kept)")
         a.set_xlabel("prunable layer (network order)"); a.legend()
+        if n:
+            # a line every N channels; labels every k*N, at most ~20 of them
+            k = max(1, -(-max(r[1] for r in pr) // (20 * n)))
+            a.yaxis.set_major_locator(MultipleLocator(k * n))
+            a.yaxis.set_minor_locator(MultipleLocator(n))
+            a.grid(axis="y", which="both", alpha=.3); a.set_axisbelow(True)
     else:
         a.axis("off")
     fig.tight_layout()
