@@ -466,10 +466,8 @@ class PITSearchTrainer(DetectionTrainer):
                 self.best_epoch = self.epoch
                 return True
             return False
-        # without validation (val=False) there is no fitness: the latest epoch within the budget
         fitness = float("-inf") if self.fitness is None else float(self.fitness)
-        if (self.fitness is None or self.best_within_fitness is None
-                or fitness > self.best_within_fitness):
+        if self.best_within_fitness is None or fitness > self.best_within_fitness:
             self.best_within_fitness, self.best_epoch = fitness, self.epoch
             return True
         return False

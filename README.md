@@ -78,7 +78,8 @@ regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}, margin: 0.05}
     among those with every cost within `target * (1 + margin)`. Until one is, `best.pt` is the
     latest epoch (and stays so, with a warning, if none ever is). With `standard` there are no
     targets and `best.pt` is always the latest epoch.
-- The search validates `best.pt` at the end and exports it as the pruned model.
+- The search validates every epoch (`val: false` is overridden: `best.pt` needs the fitness),
+  validates `best.pt` at the end and exports it as the pruned model.
 - The old flat keys (`lam`, `nas_lr0`, `pit_warmup_epochs`, ...) still work.
 
 ### Costs

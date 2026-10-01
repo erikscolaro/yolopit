@@ -8,8 +8,8 @@ from ultralytics.utils import LOGGER
 def apply_pit_defaults(overrides, who):
     """Defaults for the PIT workflow: the input model is ALREADY fine-tuned on the data and a
     fine-tuning follows, so no LR warmup; weights optimizer SGD (with Ultralytics' momentum);
-    AMP off in the search. Explicit user values win, with a warning where they go against the
-    workflow."""
+    AMP off and validation on in the search. Explicit user values win, with a warning where they
+    go against the workflow."""
     overrides = dict(overrides or {})
     if "warmup_epochs" not in overrides:
         overrides["warmup_epochs"] = 0
@@ -23,6 +23,10 @@ def apply_pit_defaults(overrides, who):
                        f"precision)" if who == "search" else f"PIT ({who}): AMP enabled")
     if who == "search":
         overrides["amp"] = False
+        if overrides.get("val", True) is False:
+            LOGGER.warning("PIT (search): validation requested off but enabled (best.pt is the "
+                           "epoch with the highest fitness within the budget)")
+        overrides["val"] = True
     return overrides
 
 

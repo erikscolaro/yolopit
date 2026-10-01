@@ -53,6 +53,7 @@ check(s.arch["n"] == 8 and s.arch["trace_imgsz"] == 320,
       f"pit.n and trace_imgsz (= imgsz) taken from the YAML: {s.arch}")
 s.train()
 tr = s.trainer
+check(tr.args.val is True, f"validation forced on in the search (val=False requested): {tr.args.val}")
 rows = rows_of(tr)
 keys = rows[0].keys()
 check({"train/ops", "train/params", "train/reg"} <= set(keys), f"cost columns in results.csv")

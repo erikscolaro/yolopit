@@ -38,11 +38,6 @@ def test_best_is_latest_when_never_within_budget():
     assert saved == [0, 1, 2] and best == 2
 
 
-def test_best_without_fitness_is_latest_within_budget():
-    saved, best = run([(None, False), (None, True), (None, True), (None, False)])
-    assert saved == [0, 1, 2] and best == 2
-
-
 def test_best_is_latest_without_targets():
     saved, best = run([(0.8, None), (0.5, None), (0.9, None)])
     assert saved == [0, 1, 2] and best == 2
