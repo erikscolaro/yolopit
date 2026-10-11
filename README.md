@@ -60,13 +60,18 @@ fine-tuning, ONNX).
 Ultralytics train arguments at top level, plus three groups:
 
 ```yaml
-pit:          {n: 16, remainder: true, trace_imgsz: null, warmup_epochs: 0, ema: false}
+pit:          {n: 16, remainder: true, trace_imgsz: null, warmup_epochs: 0, ema: false,
+               discrete_cost: false}
 nas:          {optimizer: AdamW, lr0: 0.01, lrf: 1.0, cos_lr: false, weight_decay: 0.0}
 regularizer:  {mode: standard, lambda: {ops: 1.0}}          # or
 regularizer:  {mode: duccio, target: {ops: 40%, params: 1.5M}, margin: 0.05}
 ```
 
 - `pit` fixes the search space, so `PITYOLO(...)` reads it when it builds the model.
+  `discrete_cost: true` makes the regularizer use the cost of the binarized masks (what the
+  export gives, with a straight-through gradient) instead of the soft one. Useful with small N
+  (e.g. 1): there many masks sit just above the threshold, the soft cost is lower than the real
+  one and DUCCIO stops pushing before the target is reached.
 - `nas`: optimizer and scheduler of the masks, separate from the weights.
 - `regularizer`: the cost term in the loss.
   - `standard`: `lambda` per cost (each cost as a fraction of its initial value). Pruning goes

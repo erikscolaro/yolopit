@@ -9,6 +9,8 @@
       trace_imgsz: null         # image size of the cost; null -> imgsz
       warmup_epochs: 0          # epochs with frozen masks before the search
       ema: false                # EMA of the weights during the search
+      discrete_cost: false      # regularizer on the cost of the binarized masks (STE), not the
+                                #   soft one; useful with small N, where the soft cost is too low
     nas:                        # optimizer and scheduler of the masks
       optimizer: AdamW          # AdamW | Adam | SGD
       lr0: 0.01
@@ -37,7 +39,8 @@ METRICS = ("ops", "params")
 MODES = ("standard", "duccio")
 
 DEFAULTS = {
-    "pit": dict(n=8, remainder=True, trace_imgsz=None, warmup_epochs=0, ema=False),
+    "pit": dict(n=8, remainder=True, trace_imgsz=None, warmup_epochs=0, ema=False,
+                discrete_cost=False),
     "nas": dict(optimizer="AdamW", lr0=0.01, lrf=1.0, cos_lr=False, weight_decay=0.0,
                 lr_lambda=None),
     "regularizer": dict(mode="standard"),
@@ -134,6 +137,9 @@ def split(conf: dict, legacy_cost: str = "ops") -> tuple[dict, dict]:
     groups["nas"] = {**DEFAULTS["nas"], **groups["nas"]}
     groups["regularizer"] = _check_regularizer(groups["regularizer"])
     _check_nas(groups["nas"])
+    if not isinstance(groups["pit"]["discrete_cost"], bool):
+        raise ConfigError(f"pit.discrete_cost must be true or false, got "
+                          f"{groups['pit']['discrete_cost']!r}")
     return conf, groups
 
 

@@ -8,6 +8,7 @@ def test_defaults():
     ultra, g = split({"data": "d.yaml", "epochs": 3})
     assert ultra == {"data": "d.yaml", "epochs": 3}
     assert g["pit"]["n"] == 8 and g["pit"]["ema"] is False and g["pit"]["warmup_epochs"] == 0
+    assert g["pit"]["discrete_cost"] is False
     assert g["nas"]["optimizer"] == "AdamW" and g["nas"]["lrf"] == 1.0
     assert g["regularizer"] == {"mode": "standard", "lambda": {"ops": 1.0}}
 
@@ -60,6 +61,7 @@ def test_parse_amount_errors(value):
     ({"regularizer": {"lambda": {"latency": 1.0}}}, "unknown cost"),
     ({"regularizer": {"lambda": {"ops": -1}}}, ">= 0"),
     ({"pit": {"N": 16}}, "unknown key"),
+    ({"pit": {"discrete_cost": "yes"}}, "true or false"),
     ({"nas": {"optimizer": "Lion"}}, "AdamW, Adam or SGD"),
     ({"nas_lr0": 0.1, "nas": {"lr0": 0.2}}, "both set"),
     ({"lam": 1.0, "regularizer": {"lambda": {"ops": 1.0}}}, "both set"),

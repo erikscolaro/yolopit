@@ -179,10 +179,11 @@ def _pit_costs(pit, minimum: bool = False) -> dict:
 
 
 def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, verbose=True,
-                    cost=None) -> PITDetectionModel:
+                    cost=None, discrete_cost=False) -> PITDetectionModel:
     """YOLO26 weights/yaml -> PITDetectionModel wrapping a PIT model with block masks, with the
     costs of the whole model (initial, fixed part, minimum) at trace_imgsz. `cost` is ignored
-    (kept for old calls: both costs are always tracked)."""
+    (kept for old calls: both costs are always tracked). discrete_cost=True: the regularizer
+    sees the cost of the binarized masks (straight-through gradient) instead of the soft one."""
     src = YOLO(model).model.float().eval()
     for p in src.parameters():      # checkpoints load frozen; the trainer would re-enable them
         p.requires_grad_(True)       # anyway, with one warning per parameter
@@ -197,7 +198,7 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
     detect.export = True                    # single-tensor output while PLiNIO traces the graph
     try:
         pit = PIT(net, cost=dict(COSTS), input_shape=(3, trace_imgsz, trace_imgsz),
-                  train_rf=False, train_dilation=False)
+                  train_rf=False, train_dilation=False, discrete_cost=bool(discrete_cost))
     finally:
         detect.export = False
     n_pit = sum(1 for m in pit.seed.modules() if isinstance(m, PITModule) and isinstance(m, COUNTED))
@@ -218,7 +219,8 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
     costs = {m: dict(total=wrapper.total0[m], pit=wrapper.cost0[m], fixed=fixed[m],
                      min_total=wrapper.min_total[m], min_pit=min_pit[m]) for m in COSTS}
     wrapper.pit_meta = dict(model=str(model), n=n, remainder=remainder, trace_imgsz=trace_imgsz,
-                            yolopit=YOLOPIT_VERSION, costs=costs, **info)
+                            discrete_cost=bool(discrete_cost), yolopit=YOLOPIT_VERSION,
+                            costs=costs, **info)
     if verbose:
         LOGGER.info(cost_table(wrapper))
     return wrapper
@@ -594,6 +596,7 @@ def search_summary(model: PITDetectionModel, trainer=None, regularizer=None) -> 
     out = dict(yolopit=YOLOPIT_VERSION, ultralytics=ULTRALYTICS_VERSION,
                model=model.pit_meta.get("model"), n=model.pit_meta.get("n"),
                remainder=model.pit_meta.get("remainder"), imgsz=model.pit_meta.get("trace_imgsz"),
+               discrete_cost=model.pit_meta.get("discrete_cost", False),
                detect_branch=model.pit_meta.get("detect_branch"), regularizer=reg_info,
                costs=costs,
                prunable_channels=dict(before=sum(r[1] for r in rows if r[3]),
@@ -614,29 +617,32 @@ def search_summary(model: PITDetectionModel, trainer=None, regularizer=None) -> 
 class PITYOLO:
     """Ultralytics-like entry point for the PIT channel search.
 
-    PITYOLO(model, cfg=None, n=None, remainder=None, trace_imgsz=None)
+    PITYOLO(model, cfg=None, n=None, remainder=None, trace_imgsz=None, discrete_cost=None)
       model: YOLO26 weights already trained on your data (or a yaml).
       cfg: search config (YAML path or dict, see yolopit.config): Ultralytics arguments plus the
-           groups `pit`, `nas`, `regularizer`. The `pit` group (n, remainder, trace_imgsz) fixes
-           the search space, so it is used here; explicit arguments override it.
+           groups `pit`, `nas`, `regularizer`. The `pit` group (n, remainder, trace_imgsz,
+           discrete_cost) fixes the search space, so it is used here; explicit arguments
+           override it.
       trace_imgsz: image size at which the costs are computed; default: pit.trace_imgsz, else
            the config's imgsz, else 640. Absolute targets refer to this size.
     """
 
     def __init__(self, model="yolo26n.pt", cfg=None, n=None, remainder=None, trace_imgsz=None,
-                 cost=None):
+                 cost=None, discrete_cost=None):
         self._legacy_cost = cost or "ops"   # only for the old flat key `lam`
         self._conf = _config.load(cfg)
         ultra, groups = _config.split(self._conf, self._legacy_cost)
         pit = groups["pit"]
-        for k, v in dict(n=n, remainder=remainder, trace_imgsz=trace_imgsz).items():
+        for k, v in dict(n=n, remainder=remainder, trace_imgsz=trace_imgsz,
+                         discrete_cost=discrete_cost).items():
             if v is not None:
                 pit[k] = v
         if pit["trace_imgsz"] is None:
             pit["trace_imgsz"] = int(ultra.get("imgsz", 640))
-        self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz")}
+        self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz", "discrete_cost")}
         self.model = build_pit_model(model, n=int(pit["n"]), remainder=bool(pit["remainder"]),
-                                     trace_imgsz=int(pit["trace_imgsz"]))
+                                     trace_imgsz=int(pit["trace_imgsz"]),
+                                     discrete_cost=bool(pit["discrete_cost"]))
         self.trainer = None
 
     def train(self, cfg=None, **kwargs):

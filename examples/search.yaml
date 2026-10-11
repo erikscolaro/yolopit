@@ -25,6 +25,8 @@ pit:
   trace_imgsz: null       # image size of the costs; null -> imgsz above
   warmup_epochs: 0        # epochs with frozen masks before the search (warning if > 0)
   ema: false              # EMA of the weights during the search (off: validate the current model)
+  discrete_cost: false    # regularizer on the cost of the binarized masks, not the soft one
+                          #   (true helps with small N: the soft cost underestimates the real one)
 
 # --- masks optimizer and scheduler (separate from the weights) --------------------------
 nas:

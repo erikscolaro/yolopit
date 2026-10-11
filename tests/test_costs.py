@@ -87,3 +87,27 @@ def test_duccio_targets(search):
     assert reg.targets_pit["params"] == pytest.approx(2e6 - m.fixed["params"])
     # exactly the minimum is allowed (with a warning)
     resolve_regularizer(m, {"mode": "duccio", "target": {"ops": m.min_total["ops"]}})
+
+
+def test_discrete_cost(search):
+    """pit.discrete_cost reaches PIT and every layer; real_costs restores the previous value."""
+    from yolopit import PITYOLO
+    from yolopit.config import ConfigError
+
+    def flags(net):
+        return {l.discrete_cost for l in net.seed.modules() if hasattr(l, "discrete_cost")}
+
+    m = search.model
+    assert m.net.discrete_cost is False and m.pit_meta["discrete_cost"] is False
+    m.real_costs()
+    assert m.net.discrete_cost is False and flags(m.net) == {False}
+
+    d = PITYOLO("yolo26n.pt", n=16, trace_imgsz=IMG, discrete_cost=True)
+    assert d.model.net.discrete_cost is True and flags(d.model.net) == {True}
+    assert d.model.pit_meta["discrete_cost"] is True
+    # same architecture: same costs whatever the flag
+    assert d.model.total0 == pytest.approx(m.total0, rel=1e-9)
+    d.model.real_costs()
+    assert d.model.net.discrete_cost is True and flags(d.model.net) == {True}
+    with pytest.raises(ConfigError, match="discrete_cost"):
+        d.train(data="coco8.yaml", pit={"discrete_cost": False})
