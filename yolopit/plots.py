@@ -29,7 +29,7 @@ def plot_pit_results(save_dir, channel_rows=None, n=None):
                       [x for x, v in zip(col(k), validated) if v]) if col(k) else None
     fig, ax = plt.subplots(2, 2, figsize=(13, 8))
     a = ax[0, 0]
-    metrics = [m for m in ("ops", "params") if col(f"train/{m}")] or (
+    metrics = [m for m in ("ops", "params", "latency") if col(f"train/{m}")] or (
         ["cost"] if col("train/cost") else [])      # "cost": runs made before yolopit 0.2
     for m in metrics:
         a.plot(ep, col(f"train/{m}"), marker=".", label=m if m != "cost" else "train")

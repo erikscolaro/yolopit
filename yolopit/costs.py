@@ -105,7 +105,9 @@ def count_outside(model: nn.Module, leaf_types) -> int:
 
 
 def fmt(value: float, metric: str) -> str:
-    """1.234G MACs / 2.57M params."""
+    """1.234G MACs / 2.57M params / 12.34ms latency."""
+    if metric == "latency":
+        return f"{value:.2f}ms"
     for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "K")):
         if abs(value) >= div:
             return f"{value / div:.3f}{suf}"

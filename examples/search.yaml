@@ -27,6 +27,9 @@ pit:
   ema: false              # EMA of the weights during the search (off: validate the current model)
   discrete_cost: false    # regularizer on the cost of the binarized masks, not the soft one
                           #   (true helps with small N: the soft cost underestimates the real one)
+  latency: null           # cost `latency` in ms (RPi 5 LUT, needs trace_imgsz 640, see README):
+                          #   {arch: w0.25_D126}, optional estimator (lut|smooth|secant) and
+                          #   lut_dir / fit (default: yolopit/data/rpi5)
 
 # --- masks optimizer and scheduler (separate from the weights) --------------------------
 nas:

@@ -102,6 +102,43 @@ part, fixed part and the minimum reachable (every prunable layer at one block of
 `train/reg` (the cost term). `pit_summary.json` has initial, final and minimum costs and the
 targets.
 
+### Latency cost (Raspberry Pi 5)
+
+A third cost, `latency` in ms, from the per-layer latency LUT measured on the Pi
+(`yolopit.latency`, a PLiNIO CostSpec like `mpic_latency`):
+
+    latency = C_arch + sum_f a_f * sum_{prunable convs l in family f} LUT_f(c_in_l, c_out_l)
+
+```yaml
+imgsz: 640
+pit:
+  n: 2
+  latency:
+    arch: w0.25_D126            # key of C_ms in fit.json
+    estimator: smooth           # optional: lut | smooth | secant (gradient only, see below)
+    # lut_dir: ...              # optional: lut_<family>.csv (c_in, c_out, median_ms) and
+    # fit: .../fit.json         #   fit.json ("a" per family, "C_ms" per architecture);
+                                #   default: the Raspberry Pi 5 data in yolopit/data/rpi5
+regularizer: {mode: duccio, target: {latency: 30}}   # ms (or 60%); or lambda: {latency: 1.0}
+```
+
+- Families are kernel, stride and output map at 640x640 (`k3s2_40`), so the cost needs
+  `trace_imgsz` = 640. Only the prunable convs are in the LUT sum; C2PSA, PSABlock, Detect and the
+  non-conv nodes are in `C_arch`, the fixed part. An `arch` missing from the fit is an error.
+- During the search the LUT is interpolated bilinearly on the effective (soft) channels, capped
+  at the real ones: exact on the measured points, differentiable in between. With
+  `discrete_cost: true` it is read at the channels of the binarized masks. A layer the LUT does
+  not cover is an error, never an extrapolation.
+- The LUT is not monotone (on the Pi 64 channels can be faster than 62). The cost value is always
+  the LUT; `pit.latency.estimator` picks how its gradient is computed (straight-through, as PIT does
+  with its masks), so that searches can compare them:
+  - `lut`: slope of the LUT segment, blind to steps further away;
+  - `smooth` (default): slope of a monotone surrogate per family, every step weighs the same;
+  - `secant`: slope of the line to D channels below, D shrinking over the search: sees the steps
+    within D (from the step spacing of the LUT, mostly 32, to 2), a higher step pushes harder;
+  - `best`: slope of the steepest line to any measured point below, at any distance, no schedule.
+  DUCCIO targets stay `latency` (ms) whatever the estimator.
+
 ## What it does
 
 - **C3k2** blocks are replaced by an exactly equivalent version without `chunk` (`C3k2Split`),
@@ -127,6 +164,7 @@ targets.
 | `yolopit.config` | no | search config: groups, defaults, checks |
 | `yolopit.costs` | no | real cost of the whole model, fixed part |
 | `yolopit.regularizers` | yes | standard and DUCCIO cost terms |
+| `yolopit.latency` | yes | latency cost of the Raspberry Pi 5 (LUT + fit) |
 | `yolopit.plots` | no | `pit_results.png` |
 
 The class paths in `yolopit.runtime` are part of the checkpoint format: a pruned `.pt` stores

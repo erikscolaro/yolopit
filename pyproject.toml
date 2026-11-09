@@ -32,6 +32,7 @@ test = ["pytest==9.1.1", "onnx==1.23.1", "onnxruntime==1.30.0"]
 
 [tool.setuptools]
 packages = ["yolopit"]
+package-data = {yolopit = ["data/rpi5/*.csv", "data/rpi5/*.json"]}   # Raspberry Pi 5 latency LUT and fit
 # old module names, kept so that checkpoints and scripts made before 0.1 still load
 py-modules = ["pit_yolo", "pit_block_masks"]
 

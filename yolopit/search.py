@@ -55,6 +55,7 @@ from . import __version__ as YOLOPIT_VERSION
 from . import config as _config
 from ._common import apply_pit_defaults, enable_grads
 from .config import ConfigError
+from .latency import LUT_IMGSZ, rpi5_latency
 from .costs import COUNTED, count_outside, fixed_costs, fmt
 from .plots import plot_pit_results
 from .regularizers import DuccioRegularizer, StandardRegularizer
@@ -157,7 +158,7 @@ class PITDetectionModel(FxDetectionModel):
         return rows
 
 
-def _pit_costs(pit, minimum: bool = False) -> dict:
+def _pit_costs(pit, names, minimum: bool = False) -> dict:
     """Discrete PIT cost of each metric; minimum=True: with every block mask off (each prunable
     layer keeps only its keep-alive block), the masks are restored afterwards."""
     maskers = {id(l.out_features_masker): l.out_features_masker for l in pit.seed.modules()
@@ -170,7 +171,7 @@ def _pit_costs(pit, minimum: bool = False) -> dict:
             if minimum:
                 for m in maskers.values():
                     m.block.zero_()
-            return {name: float(pit.get_cost(name)) for name in COSTS}
+            return {name: float(pit.get_cost(name)) for name in names}
     finally:
         with torch.no_grad():
             for k, m in maskers.items():
@@ -179,11 +180,13 @@ def _pit_costs(pit, minimum: bool = False) -> dict:
 
 
 def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, verbose=True,
-                    cost=None, discrete_cost=False) -> PITDetectionModel:
+                    cost=None, discrete_cost=False, latency=None) -> PITDetectionModel:
     """YOLO26 weights/yaml -> PITDetectionModel wrapping a PIT model with block masks, with the
     costs of the whole model (initial, fixed part, minimum) at trace_imgsz. `cost` is ignored
     (kept for old calls: both costs are always tracked). discrete_cost=True: the regularizer
-    sees the cost of the binarized masks (straight-through gradient) instead of the soft one."""
+    sees the cost of the binarized masks (straight-through gradient) instead of the soft one.
+    latency={lut_dir, fit, arch}: adds the cost `latency` in ms (yolopit.latency), whose fixed
+    part is the C_arch of the fit."""
     src = YOLO(model).model.float().eval()
     for p in src.parameters():      # checkpoints load frozen; the trainer would re-enable them
         p.requires_grad_(True)       # anyway, with one warning per parameter
@@ -192,12 +195,22 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
             src.model[i] = C3k2Split(layer).eval()
     detect = src.model[-1]
     fixed, info = fixed_costs(src, LEAVES, detect, trace_imgsz, COSTS)
+    costs_spec = dict(COSTS)
+    latency_luts = {}
+    if latency:
+        if trace_imgsz != LUT_IMGSZ:
+            raise ConfigError(f"pit.latency needs trace_imgsz = {LUT_IMGSZ} (the LUT was "
+                              f"measured there), got {trace_imgsz}")
+        try:
+            costs_spec["latency"], fixed["latency"], latency_luts = rpi5_latency(**latency)
+        except KeyError as e:          # architecture not in the fit: a config problem
+            raise ConfigError(str(e.args[0])) from None
     outside = count_outside(src, LEAVES)
 
     net = YoloFx(src.model, src.save).eval()
     detect.export = True                    # single-tensor output while PLiNIO traces the graph
     try:
-        pit = PIT(net, cost=dict(COSTS), input_shape=(3, trace_imgsz, trace_imgsz),
+        pit = PIT(net, cost=costs_spec, input_shape=(3, trace_imgsz, trace_imgsz),
                   train_rf=False, train_dilation=False, discrete_cost=bool(discrete_cost))
     finally:
         detect.export = False
@@ -211,15 +224,17 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
     apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
 
     wrapper = PITDetectionModel(pit, detect, src)
-    wrapper.cost0 = _pit_costs(pit)
-    min_pit = _pit_costs(pit, minimum=True)
+    wrapper.cost0 = _pit_costs(pit, costs_spec)
+    min_pit = _pit_costs(pit, costs_spec, minimum=True)
     wrapper.fixed = fixed
-    wrapper.total0 = {m: wrapper.cost0[m] + fixed[m] for m in COSTS}
-    wrapper.min_total = {m: min_pit[m] + fixed[m] for m in COSTS}
+    wrapper.latency_luts = latency_luts      # their `progress` follows the search (secant estimator)
+    wrapper.total0 = {m: wrapper.cost0[m] + fixed[m] for m in costs_spec}
+    wrapper.min_total = {m: min_pit[m] + fixed[m] for m in costs_spec}
     costs = {m: dict(total=wrapper.total0[m], pit=wrapper.cost0[m], fixed=fixed[m],
-                     min_total=wrapper.min_total[m], min_pit=min_pit[m]) for m in COSTS}
+                     min_total=wrapper.min_total[m], min_pit=min_pit[m]) for m in costs_spec}
     wrapper.pit_meta = dict(model=str(model), n=n, remainder=remainder, trace_imgsz=trace_imgsz,
-                            discrete_cost=bool(discrete_cost), yolopit=YOLOPIT_VERSION,
+                            discrete_cost=bool(discrete_cost), latency=latency,
+                            yolopit=YOLOPIT_VERSION,
                             costs=costs, **info)
     if verbose:
         LOGGER.info(cost_table(wrapper))
@@ -245,11 +260,17 @@ def resolve_regularizer(model: PITDetectionModel, reg: dict):
     duccio: targets of the whole model (absolute or % of the input model) are checked against the
     minimum reachable and converted to the PIT part (target - fixed part)."""
     if reg["mode"] == "standard":
+        for m in set(reg["lambda"]) - set(model.cost0):
+            raise ConfigError(f"regularizer.lambda.{m}: the model was built without the cost {m} "
+                              f"(pit.latency not set)")
         r = StandardRegularizer(reg["lambda"], model.cost0)
         return r, dict(mode="standard", **{"lambda": dict(reg["lambda"])})
     n = model.pit_meta["n"]
     targets_pit, info = {}, {}
     for m, raw in reg["target"].items():
+        if m not in model.total0:
+            raise ConfigError(f"regularizer.target.{m}: the model was built without the cost {m} "
+                              f"(pit.latency not set)")
         kind, value = _config.parse_amount(raw, f"regularizer.target.{m}")
         total, minimum, fixed = model.total0[m], model.min_total[m], model.fixed[m]
         target = value if kind == "abs" else value / 100 * total
@@ -374,6 +395,8 @@ class PITSearchTrainer(DetectionTrainer):
         model.search_active = trainer.search_phase
         model.reg_epoch = max(trainer.epoch - trainer.WARMUP_EPOCHS, 0)
         model.reg_epochs = max(trainer.epochs - trainer.WARMUP_EPOCHS, 1)
+        for lut in getattr(model, "latency_luts", {}).values():
+            lut.progress = model.reg_epoch / max(model.reg_epochs - 1, 1)
         if trainer.search_phase and trainer.nas_optimizer is not None:
             lr = trainer.NAS_LR * trainer.nas_lr_factor(trainer.epoch)
             for g in trainer.nas_optimizer.param_groups:
@@ -639,10 +662,12 @@ class PITYOLO:
                 pit[k] = v
         if pit["trace_imgsz"] is None:
             pit["trace_imgsz"] = int(ultra.get("imgsz", 640))
-        self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz", "discrete_cost")}
+        self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz", "discrete_cost",
+                                         "latency")}
         self.model = build_pit_model(model, n=int(pit["n"]), remainder=bool(pit["remainder"]),
                                      trace_imgsz=int(pit["trace_imgsz"]),
-                                     discrete_cost=bool(pit["discrete_cost"]))
+                                     discrete_cost=bool(pit["discrete_cost"]),
+                                     latency=pit["latency"])
         self.trainer = None
 
     def train(self, cfg=None, **kwargs):

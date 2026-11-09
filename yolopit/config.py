@@ -11,6 +11,11 @@
       ema: false                # EMA of the weights during the search
       discrete_cost: false      # regularizer on the cost of the binarized masks (STE), not the
                                 #   soft one; useful with small N, where the soft cost is too low
+      latency: null             # adds the cost `latency` (ms, Raspberry Pi 5 LUT, yolopit.latency):
+                                #   {arch: w0.25_D126} plus optional estimator (lut | smooth |
+                                #   secant | best: how the gradient is computed, the value is always the
+                                #   LUT; default smooth) and lut_dir / fit to override the LUT and
+                                #   fit.json shipped in yolopit/data/rpi5
     nas:                        # optimizer and scheduler of the masks
       optimizer: AdamW          # AdamW | Adam | SGD
       lr0: 0.01
@@ -20,7 +25,8 @@
     regularizer:
       mode: standard            # standard | duccio
       lambda: {ops: 1.0}        # standard: weight of each cost (fraction of its initial value)
-      target: {ops: 40%}        # duccio: budget per cost, absolute (1.2G, 800M, 2e6) or % of the
+      target: {ops: 40%}        # duccio: budget per cost (ops, params, latency in ms if pit.latency
+                                #   is set), absolute (1.2G, 800M, 2e6, 25) or % of the
                                 #   whole input model
       margin: 0.05              # duccio: best.pt is the best epoch with every cost within
                                 #   target * (1 + margin)
@@ -35,12 +41,12 @@ from pathlib import Path
 
 from ultralytics.utils import LOGGER
 
-METRICS = ("ops", "params")
+METRICS = ("ops", "params", "latency")
 MODES = ("standard", "duccio")
 
 DEFAULTS = {
     "pit": dict(n=8, remainder=True, trace_imgsz=None, warmup_epochs=0, ema=False,
-                discrete_cost=False),
+                discrete_cost=False, latency=None),
     "nas": dict(optimizer="AdamW", lr0=0.01, lrf=1.0, cos_lr=False, weight_decay=0.0,
                 lr_lambda=None),
     "regularizer": dict(mode="standard"),
@@ -140,7 +146,33 @@ def split(conf: dict, legacy_cost: str = "ops") -> tuple[dict, dict]:
     if not isinstance(groups["pit"]["discrete_cost"], bool):
         raise ConfigError(f"pit.discrete_cost must be true or false, got "
                           f"{groups['pit']['discrete_cost']!r}")
+    _check_latency(groups["pit"]["latency"])
+    reg = groups["regularizer"]
+    used = {**reg.get("lambda", {}), **reg.get("target", {})}
+    if "latency" in used and not groups["pit"]["latency"]:
+        raise ConfigError("the cost 'latency' needs pit.latency: {lut_dir, fit, arch}")
     return conf, groups
+
+
+LATENCY_KEYS = ("arch",)                          # required; lut_dir, fit, estimator are optional
+LATENCY_OPTIONAL = ("lut_dir", "fit", "estimator")
+LATENCY_ESTIMATORS = ("lut", "smooth", "secant", "best")   # yolopit.latency.ESTIMATORS
+
+
+def _check_latency(lat):
+    if lat is None:
+        return
+    if not isinstance(lat, dict) or not set(LATENCY_KEYS) <= set(lat) \
+            or set(lat) - set(LATENCY_KEYS) - set(LATENCY_OPTIONAL):
+        raise ConfigError(f"pit.latency must be a mapping with the key arch and optionally "
+                          f"{LATENCY_OPTIONAL}, got {lat!r}")
+    if lat.get("estimator", "smooth") not in LATENCY_ESTIMATORS:
+        raise ConfigError(f"pit.latency.estimator must be one of {LATENCY_ESTIMATORS}, "
+                          f"got {lat['estimator']!r}")
+    if lat.get("lut_dir") is not None and not Path(lat["lut_dir"]).is_dir():
+        raise ConfigError(f"pit.latency.lut_dir {lat['lut_dir']} is not a directory")
+    if lat.get("fit") is not None and not Path(lat["fit"]).is_file():
+        raise ConfigError(f"pit.latency.fit {lat['fit']} is not a file")
 
 
 def _check_nas(nas: dict):
