@@ -31,9 +31,22 @@ def test_kwargs_override_yaml_across_styles():
 def test_duccio_targets():
     _, g = split({"regularizer": {"mode": "duccio", "target": {"ops": "40%", "params": "1.5M"}}})
     assert g["regularizer"] == {"mode": "duccio", "target": {"ops": "40%", "params": "1.5M"},
-                                "margin": 0.05}
-    _, g = split({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "margin": 0.1}})
-    assert g["regularizer"]["margin"] == 0.1
+                                "margin": 0.05, "strength": 1.0}
+    _, g = split({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "margin": 0.1,
+                                  "strength": 10}})
+    assert g["regularizer"]["margin"] == 0.1 and g["regularizer"]["strength"] == 10.0
+    for bad in (0, -1, True, "x"):
+        with pytest.raises(ConfigError):
+            split({"regularizer": {"mode": "duccio", "target": {"ops": "40%"}, "strength": bad}})
+    with pytest.raises(ConfigError):
+        split({"regularizer": {"mode": "standard", "strength": 2}})
+
+
+def test_duccio_strength_scales():
+    from yolopit.regularizers import DuccioRegularizer
+    r1, r10 = DuccioRegularizer({"ops": 1.0}), DuccioRegularizer({"ops": 1.0}, strength=10)
+    r1.start(2.0); r10.start(2.0)
+    assert r10._duccio.task_loss == 10 * r1._duccio.task_loss
 
 
 @pytest.mark.parametrize("value,expected", [

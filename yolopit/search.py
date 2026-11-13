@@ -299,8 +299,10 @@ def resolve_regularizer(model: PITDetectionModel, reg: dict):
             targets_pit[m] = target - fixed
         info[m] = dict(requested=raw, target_total=target, target_fraction=target / total,
                        target_pit=target - fixed)
-    return DuccioRegularizer(targets_pit), dict(mode="duccio", target=info,
-                                                margin=float(reg.get("margin", 0.0)))
+    strength = float(reg.get("strength", 1.0))
+    return DuccioRegularizer(targets_pit, strength), dict(mode="duccio", target=info,
+                                                          margin=float(reg.get("margin", 0.0)),
+                                                          strength=strength)
 
 
 def within_budget(costs: dict, reg_info: dict | None) -> bool | None:

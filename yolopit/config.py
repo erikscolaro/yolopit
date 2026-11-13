@@ -30,6 +30,8 @@
                                 #   whole input model
       margin: 0.05              # duccio: best.pt is the best epoch with every cost within
                                 #   target * (1 + margin)
+      strength: 1.0             # duccio: multiplier of the strength DUCCIO derives from the task
+                                #   loss (>1: the costs push harder against the detection loss)
 
 The old flat keys (lam, nas_lr0, pit_warmup_epochs, ...) are still accepted and mapped here.
 """
@@ -51,7 +53,7 @@ DEFAULTS = {
                 lr_lambda=None),
     "regularizer": dict(mode="standard"),
 }
-REG_KEYS = ("mode", "lambda", "target", "margin")
+REG_KEYS = ("mode", "lambda", "target", "margin", "strength")
 DEFAULT_MARGIN = 0.05
 GROUPS = tuple(DEFAULTS)
 
@@ -191,6 +193,9 @@ def _check_regularizer(reg: dict) -> dict:
         if reg.get("margin") is not None:
             raise ConfigError("regularizer.margin is for mode 'duccio': mode 'standard' has no "
                               "targets, its best.pt is the last epoch")
+        if reg.get("strength") is not None:
+            raise ConfigError("regularizer.strength is for mode 'duccio': mode 'standard' uses "
+                              "regularizer.lambda")
         lambdas = reg.get("lambda")
         lambdas = {"ops": 1.0} if lambdas is None else lambdas
         if not isinstance(lambdas, dict) or not lambdas:
@@ -216,7 +221,12 @@ def _check_regularizer(reg: dict) -> dict:
     if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0 <= margin < 1:
         raise ConfigError(f"regularizer.margin must be a fraction of the target in [0, 1), e.g. "
                           f"0.05 for 5%, got {margin!r}")
-    return {"mode": mode, "target": dict(targets), "margin": float(margin)}
+    strength = reg.get("strength")
+    strength = 1.0 if strength is None else strength
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or strength <= 0:
+        raise ConfigError(f"regularizer.strength must be a number > 0, got {strength!r}")
+    return {"mode": mode, "target": dict(targets), "margin": float(margin),
+            "strength": float(strength)}
 
 
 def _check_metrics(d: dict, where: str):

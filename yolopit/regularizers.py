@@ -30,8 +30,9 @@ class StandardRegularizer:
 class DuccioRegularizer:
     mode = "duccio"
 
-    def __init__(self, targets_pit: dict):
+    def __init__(self, targets_pit: dict, strength: float = 1.0):
         self.targets_pit = dict(targets_pit)
+        self.strength = float(strength)    # multiplies DUCCIO's strengths (they scale with task_loss)
         self._duccio = None
 
     @property
@@ -40,7 +41,7 @@ class DuccioRegularizer:
 
     def start(self, task_loss: float):
         """DUCCIO scales its strengths on the task loss at the beginning of the search."""
-        self._duccio = DUCCIO(self.targets_pit, task_loss=float(task_loss))
+        self._duccio = DUCCIO(self.targets_pit, task_loss=float(task_loss) * self.strength)
 
     def __call__(self, net, epoch: int, epochs: int) -> torch.Tensor:
         if self._duccio is None:
@@ -55,5 +56,6 @@ class DuccioRegularizer:
     def describe(self) -> str:
         if not self.targets_pit:
             return "DUCCIO, no target below the initial cost: nothing to prune"
-        return "DUCCIO, targets on the PIT part: " + ", ".join(
+        k = f" (strength x{self.strength:g})" if self.strength != 1.0 else ""
+        return f"DUCCIO{k}, targets on the PIT part: " + ", ".join(
             f"{m} <= {v:,.0f}" for m, v in self.targets_pit.items())
