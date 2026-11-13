@@ -12,6 +12,8 @@ conv is a measured LUT, interpolated bilinearly on the effective channels:
 - LUT_f: <lut_dir>/lut_<f>.csv (c_in, c_out, median_ms), on a grid of step 2 (1, the even values,
   the max of each layer); the grid of a family is the union of its layers' rectangles.
 - a_f and C_arch: <fit> json, keys "a" ({family or "fam1+fam2": a}) and "C_ms" ({arch: C}).
+  The shipped fit (13/11) is fitted on random pruned nets (B4-R) plus PIT nets of the nano and near archs; on held-out
+  PIT nets the bias is -0.3 % (p99 1.5 %), on B4-R held-out archs p99 3.5 % (yoloeval experiments/pruning/fit_pit).
 - in_channels / out_channels are PLiNIO's effective channels (soft, or binarized with
   discrete_cost), capped at the real channels of the conv: bilinear interpolation between the 4
   grid points around them is exact on the measured points and lets the gradient reach the masks
