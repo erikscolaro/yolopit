@@ -102,6 +102,7 @@ class PITDetectionModel(FxDetectionModel):
         self.fixed = {}             # part PIT does not see (constant)
         self.total0 = {}            # whole model, initial
         self.min_total = {}         # whole model, every prunable layer at one block
+        self.costs_cache = None     # real_costs(fraction=True) for the loss items, see loss()
 
     @property
     def is_pit(self) -> bool:
@@ -123,7 +124,9 @@ class PITDetectionModel(FxDetectionModel):
             # batch size: the cost term is appended as one more component, scaled the same way
             loss = torch.cat([loss.reshape(-1), (reg * bs).reshape(1).to(loss.dtype)])
             reg_value = reg.detach().reshape(())
-        for m, v in self.real_costs(fraction=True).items():
+        if self.costs_cache is None:     # real costs: once per epoch (start, then end), not per batch
+            self.costs_cache = self.real_costs(fraction=True)
+        for m, v in self.costs_cache.items():
             items[m] = v.to(loss.device)
         items["reg"] = reg_value
         return loss, items
@@ -393,6 +396,7 @@ class PITSearchTrainer(DetectionTrainer):
         trainer.search_phase = trainer.epoch >= trainer.WARMUP_EPOCHS
         model.net.train_features = trainer.search_phase
         model.search_active = trainer.search_phase
+        model.costs_cache = None
         model.reg_epoch = max(trainer.epoch - trainer.WARMUP_EPOCHS, 0)
         model.reg_epochs = max(trainer.epochs - trainer.WARMUP_EPOCHS, 1)
         for lut in getattr(model, "latency_luts", {}).values():
@@ -414,6 +418,11 @@ class PITSearchTrainer(DetectionTrainer):
 
     @staticmethod
     def _on_epoch_end(trainer):
+        # train/ops, params, latency in results.csv: the architecture at the END of the epoch
+        model = unwrap_model(trainer.model)
+        if model.is_pit and model.total0 and trainer.tloss:
+            model.costs_cache = model.real_costs(fraction=True)
+            trainer.tloss.update({m: v for m, v in model.costs_cache.items() if m in trainer.tloss})
         # masks lr in results.csv (0 during the PIT warmup: the masks optimizer does not step)
         if trainer.nas_optimizer is not None:
             lr = trainer.nas_optimizer.param_groups[0]["lr"] if trainer.search_phase else 0.0

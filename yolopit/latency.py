@@ -269,10 +269,13 @@ def rpi5_latency(arch: str, lut_dir=None, fit=None, estimator: str = "smooth") -
         # soft effective channels can pass the real ones (PIT masks |alpha| > 1): the conv never
         # has more channels than its weight, so cap them there (no gradient above, as in reality)
         c_out_max, c_in_max = spec["_parameters"]["weight"].shape[:2]
-        c_in = torch.clamp(torch.as_tensor(spec["in_channels"], dtype=torch.float64), max=c_in_max)
-        c_out = torch.clamp(torch.as_tensor(spec["out_channels"], dtype=torch.float64),
-                            max=c_out_max)
-        return a[fam] * luts[fam](c_in, c_out).float()
+        # the LUT works on the CPU: on the GPU every conv costs syncs and tiny kernels (~4x slower);
+        # .cpu()/.to() keep the autograd graph, the result goes back to the masks' device
+        c_out_t = torch.as_tensor(spec["out_channels"])
+        dev = c_out_t.device
+        c_in = torch.clamp(torch.as_tensor(spec["in_channels"]).cpu().double(), max=c_in_max)
+        c_out = torch.clamp(c_out_t.cpu().double(), max=c_out_max)
+        return (a[fam] * luts[fam](c_in, c_out).float()).to(dev)
 
     spec = CostSpec(shared=False, default_behavior="zero")
     spec[Conv2dGeneric] = conv2d
