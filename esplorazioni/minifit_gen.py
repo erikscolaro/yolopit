@@ -1,6 +1,6 @@
 """Mini-fit dello stimatore con la testa aperta: reti N- potate a caso (testa compresa), IR di deploy per il Pi.
 Come src.lut.b4r di yoloeval, ma con i pesi veri e gli strati della testa one2one.
-    cd ~/Desktop/yoloeval && PYTHONPATH=<worktree yolopit> YOLOPIT_OPEN_DETECT=1 .venv/bin/python <questo file> <dir> <best.pt> [n]
+    cd ~/Desktop/yoloeval && PYTHONPATH=<worktree yolopit> YOLOPIT_OPEN_DETECT=1 .venv/bin/python <questo file> <dir> <best.pt> [n] [arch] [seed0]
 Scrive <dir>/results/nets.csv, layers.csv e <dir>/runs/nets/<rete>/ (IR + pt). Poi: python -m src.lut.pi b4r <dir>
 """
 import csv, shutil, sys, tempfile
@@ -38,15 +38,15 @@ def conv_layers(model):
     return rows
 
 
-def main(d: Path, weights: str, n: int = 32):
+def main(d: Path, weights: str, n: int = 32, arch: str = "w0.25_D101", seed0: int = 7000):
     cfg = lut.make_cfg(); backend = get_backend("openvino", cfg)
     res, nets = d / "results", d / "runs" / "nets"
     res.mkdir(parents=True, exist_ok=True); nets.mkdir(parents=True, exist_ok=True)
     nets_rows, layer_rows = [], []
     for j in [-1, *range(n)]:
-        name = "w0.25_D101_" + ("full" if j < 0 else f"h{j:03d}")
+        name = f"{arch}_" + ("full" if j < 0 else f"h{j:03d}")
         w = build_pit_model(weights, n=2, verbose=False)
-        g = randomize(maskers(w), -1 if j < 0 else 7000 + j)
+        g = randomize(maskers(w), -1 if j < 0 else seed0 + j)
         costs = {m: float(v) for m, v in w.real_costs().items()}
         p = PITYOLO.__new__(PITYOLO); p.model, p.trainer = w, None
         tmp = Path(tempfile.mkdtemp())
@@ -56,7 +56,7 @@ def main(d: Path, weights: str, n: int = 32):
         shutil.rmtree(dst, ignore_errors=True)
         shutil.copytree(backend.export(LocalConnection(), cfg, tmp / f"{name}.pt", tmp / "ov"), dst)
         shutil.copy(tmp / f"{name}.pt", dst / f"{name}.pt"); shutil.rmtree(tmp, ignore_errors=True)
-        nets_rows.append({"net": name, "arch": "w0.25_D101", "seed": j, "level": round(g, 4), "layers": len(layers),
+        nets_rows.append({"net": name, "arch": arch, "seed": j, "level": round(g, 4), "layers": len(layers),
                           **{f"cost_{m}": v for m, v in costs.items()}, "nonconv_elems": nonconv_elems(next(dst.glob("*.xml")))})
         layer_rows += [{"net": name, "order": i, "layer": ln, "family": f, "c_in": ci, "c_out": co} for i, (ln, f, ci, co) in enumerate(layers)]
         print(name, f"g={g:.2f}", len(layers), "strati", {m: f"{v:.3g}" for m, v in costs.items()}, flush=True)
@@ -66,4 +66,4 @@ def main(d: Path, weights: str, n: int = 32):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), sys.argv[2], *map(int, sys.argv[3:4]))
+    main(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 32, *sys.argv[4:5], *map(int, sys.argv[5:6]))
