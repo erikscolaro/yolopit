@@ -61,7 +61,9 @@ from .plots import plot_pit_results
 from .regularizers import DuccioRegularizer, StandardRegularizer
 from .runtime import C3k2Split, FxDetectionModel, YoloFx, detach_tracer
 
-LEAVES = (C2PSA, PSABlock, Detect)
+import os as _os
+# esplorazione: YOLOPIT_OPEN=Detect,PSABlock,C2PSA toglie quei blocchi dalle foglie
+LEAVES = tuple(c for c in (C2PSA, PSABlock, Detect) if c.__name__ not in _os.environ.get("YOLOPIT_OPEN", "").split(","))
 COSTS = {"ops": _cost_ops, "params": _cost_params}
 
 
