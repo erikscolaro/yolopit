@@ -23,6 +23,8 @@ PIT and PLiNIO are by the EML-EDA group, Politecnico di Torino: see README, "Cre
 """
 from __future__ import annotations
 
+import os
+
 import copy
 import csv
 import json
@@ -59,11 +61,13 @@ from .latency import LUT_IMGSZ, rpi5_latency
 from .costs import COUNTED, count_outside, fixed_costs, fmt
 from .plots import plot_pit_results
 from .regularizers import DuccioRegularizer, StandardRegularizer
-from .runtime import C3k2Split, FxDetectionModel, YoloFx, detach_tracer
+from .runtime import (C3k2Split, Detach, DetectConvs, FxDetectionModel, YoloFx, detach_tracer,
+                      link_head)
 
-import os as _os
-# esplorazione: YOLOPIT_OPEN=Detect,PSABlock,C2PSA toglie quei blocchi dalle foglie
-LEAVES = tuple(c for c in (C2PSA, PSABlock, Detect) if c.__name__ not in _os.environ.get("YOLOPIT_OPEN", "").split(","))
+LEAVES = (C2PSA, PSABlock, Detect)
+# exploration: YOLOPIT_OPEN_DETECT=1 traces the Detect convs (runtime.DetectConvs), so PIT prunes the head
+OPEN_DETECT = os.environ.get("YOLOPIT_OPEN_DETECT", "") == "1"
+ONE2MANY = ("cv2", "cv3")       # head branch used only in training: not in the deployed cost
 COSTS = {"ops": _cost_ops, "params": _cost_params}
 
 
@@ -74,7 +78,15 @@ def _install_patches(leaves=LEAVES):
         return
     orig_leaf = pit_graph.PITTracer.is_leaf_module
     pit_graph.PITTracer.is_leaf_module = (
-        lambda self, m, q: isinstance(m, leaves) or orig_leaf(self, m, q))
+        lambda self, m, q: isinstance(m, leaves + (Detach,)) or orig_leaf(self, m, q))
+    orig_fp = _insp.is_features_propagating_op
+
+    def features_propagating(n, parent):
+        if n.op == "call_module" and isinstance(parent.get_submodule(str(n.target)), Detach):
+            return True
+        return orig_fp(n, parent)
+
+    _insp.is_features_propagating_op = _annot.is_features_propagating_op = features_propagating
     orig_fd = _insp.is_features_defining_op
 
     def features_defining(n, parent):
@@ -87,6 +99,23 @@ def _install_patches(leaves=LEAVES):
 
 
 _install_patches()
+
+
+class PITDeploy(PIT):
+    """PIT whose cost skips the layers under `cost_skip` (name prefixes in the seed): with the open
+    head, the one2many branch is trained but not deployed, so it is not in ops, params or latency."""
+    cost_skip: tuple = ()
+
+    def _get_single_cost(self, cost_spec, cost_fn_map):
+        if not self.cost_skip:
+            return super()._get_single_cost(cost_spec, cost_fn_map)
+        all_, unique = self._leaf_modules, self._unique_leaf_modules
+        self._leaf_modules = [t for t in all_ if not t[0].startswith(self.cost_skip)]
+        self._unique_leaf_modules = [t for t in unique if not t[0].startswith(self.cost_skip)]
+        try:
+            return super()._get_single_cost(cost_spec, cost_fn_map)
+        finally:
+            self._leaf_modules, self._unique_leaf_modules = all_, unique
 
 
 # ============================================================================ search model
@@ -199,7 +228,8 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
         if isinstance(layer, C3k2):
             src.model[i] = C3k2Split(layer).eval()
     detect = src.model[-1]
-    fixed, info = fixed_costs(src, LEAVES, detect, trace_imgsz, COSTS)
+    leaves = tuple(c for c in LEAVES if not (OPEN_DETECT and c is Detect))
+    fixed, info = fixed_costs(src, leaves, detect, trace_imgsz, COSTS)
     costs_spec = dict(COSTS)
     latency_luts = {}
     if latency:
@@ -210,13 +240,17 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
             costs_spec["latency"], fixed["latency"], latency_luts = rpi5_latency(**latency)
         except KeyError as e:          # architecture not in the fit: a config problem
             raise ConfigError(str(e.args[0])) from None
-    outside = count_outside(src, LEAVES)
+    if OPEN_DETECT:
+        src.model[-1] = DetectConvs(detect).eval()
+        src.open_head = True
+        info["detect_branch"] = "open: one2one in the cost, one2many trained only"
+    outside = count_outside(src, leaves)
 
     net = YoloFx(src.model, src.save).eval()
     detect.export = True                    # single-tensor output while PLiNIO traces the graph
     try:
-        pit = PIT(net, cost=costs_spec, input_shape=(3, trace_imgsz, trace_imgsz),
-                  train_rf=False, train_dilation=False, discrete_cost=bool(discrete_cost))
+        pit = PITDeploy(net, cost=costs_spec, input_shape=(3, trace_imgsz, trace_imgsz),
+                        train_rf=False, train_dilation=False, discrete_cost=bool(discrete_cost))
     finally:
         detect.export = False
     n_pit = sum(1 for m in pit.seed.modules() if isinstance(m, PITModule) and isinstance(m, COUNTED))
@@ -224,9 +258,12 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
         raise RuntimeError(f"{outside} conv/linear layers outside the fx leaves but {n_pit} PIT "
                            f"layers: some layer is neither prunable nor in the fixed part, so the "
                            f"real cost would be wrong")
-    feeding = pit_layers_feeding(pit, LEAVES)
+    feeding = pit_layers_feeding(pit, leaves)
     freeze_output_channels(pit, feeding, verbose=verbose)
     apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
+    if OPEN_DETECT:
+        pit.cost_skip = tuple(f"layers.{detect.i}.{b}." for b in ONE2MANY)
+        detect = link_head(detect, pit.seed)
 
     wrapper = PITDetectionModel(pit, detect, src)
     wrapper.cost0 = _pit_costs(pit, costs_spec)
@@ -764,7 +801,10 @@ class PITYOLO:
         pit = wrapper.net
         exported = detach_tracer(pit.export())   # pruned.pt must not need PLiNIO to load
         restore_exported_bn(pit, exported, verbose=False)
-        detect = next(m for m in exported.modules() if isinstance(m, Detect))
+        if wrapper.open_head:
+            detect = link_head(wrapper.model[0], exported)
+        else:
+            detect = next(m for m in exported.modules() if isinstance(m, Detect))
         pruned = FxDetectionModel(exported, detect, wrapper).eval()
         pruned.pit_meta = {**wrapper.pit_meta, "channels": wrapper.channel_report(),
                            "final_costs": {m: float(v) for m, v in wrapper.real_costs().items()}}

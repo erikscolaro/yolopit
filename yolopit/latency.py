@@ -75,6 +75,8 @@ class FamilyLUT:
     def __init__(self, name: str, path: Path):
         pts = {(int(r["c_in"]), int(r["c_out"])): float(r["median_ms"])
                for r in csv.DictReader(open(path))}
+        if name.startswith("dw"):      # depthwise: c_in = c_out, one axis (c_in is always 1 here)
+            pts = {(1, co): v for (_, co), v in pts.items()}
         self.name, self.path = name, path
         self.xs = sorted({ci for ci, _ in pts})
         self.ys = sorted({co for _, co in pts})
@@ -262,21 +264,24 @@ def rpi5_latency(arch: str, lut_dir=None, fit=None, estimator: str = "smooth") -
 
     def conv2d(spec):
         k, s, out = spec["kernel_size"], spec["stride"], spec["output_shape"]
-        if spec["groups"] != 1 or k[0] != k[1] or s[0] != s[1]:
+        c_out_max, c_in_max = spec["_parameters"]["weight"].shape[:2]
+        dw = c_in_max == 1 and c_out_max > 1                    # depthwise: weight (c, 1, k, k)
+        if k[0] != k[1] or s[0] != s[1] or (not dw and float(torch.as_tensor(spec["groups"])) != 1):
             raise ValueError(f"latency: no LUT for a conv with groups={spec['groups']}, "
                              f"kernel {k}, stride {s}")
-        fam = f"k{k[0]}s{s[0]}_{out[-1]}"
+        fam = f"{'dw' if dw else 'k'}{k[0]}s{s[0]}_{out[-1]}"
         if fam not in luts:
             raise KeyError(f"latency: conv family {fam} has no LUT/a_f (available: "
                            f"{sorted(luts)}); the LUT is at {LUT_IMGSZ}x{LUT_IMGSZ}")
         # soft effective channels can pass the real ones (PIT masks |alpha| > 1): the conv never
         # has more channels than its weight, so cap them there (no gradient above, as in reality)
-        c_out_max, c_in_max = spec["_parameters"]["weight"].shape[:2]
         # the LUT works on the CPU: on the GPU every conv costs syncs and tiny kernels (~4x slower);
         # .cpu()/.to() keep the autograd graph, the result goes back to the masks' device
         c_out_t = torch.as_tensor(spec["out_channels"])
         dev = c_out_t.device
         c_in = torch.clamp(torch.as_tensor(spec["in_channels"]).cpu().double(), max=c_in_max)
+        if dw:
+            c_in = torch.ones((), dtype=torch.float64)
         c_out = torch.clamp(c_out_t.cpu().double(), max=c_out_max)
         return (a[fam] * luts[fam](c_in, c_out).float()).to(dev)
 
