@@ -259,6 +259,14 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
                            f"layers: some layer is neither prunable nor in the fixed part, so the "
                            f"real cost would be wrong")
     feeding = pit_layers_feeding(pit, leaves)
+    if OPEN_DETECT:
+        # one2many is not deployed and costs nothing: its own convs stay at full width (as with the closed
+        # head), only their inputs follow the neck. A masker shared with the neck (first depthwise) is not frozen.
+        skip = tuple(f"layers.{detect.i}.{b}." for b in ONE2MANY)
+        named = [(n, l) for n, l in pit.seed.named_modules() if isinstance(l, PITConv2d)]
+        deployed = {id(l.out_features_masker) for n, l in named if not n.startswith(skip)}
+        feeding = sorted(set(feeding) | {n for n, l in named
+                                         if n.startswith(skip) and id(l.out_features_masker) not in deployed})
     freeze_output_channels(pit, feeding, verbose=verbose)
     apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
     if OPEN_DETECT:
