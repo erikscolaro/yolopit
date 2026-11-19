@@ -7,3 +7,7 @@ def test_block_masks(script):
 
 def test_remainder(script):
     script("remainder.py")
+
+
+def test_soft_masks(script):
+    script("soft_masks.py")

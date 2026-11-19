@@ -9,6 +9,11 @@
       trace_imgsz: null         # image size of the cost; null -> imgsz
       warmup_epochs: 0          # epochs with frozen masks before the search
       ema: false                # EMA of the weights during the search
+      temperature: null         # T0 of the soft block masks in the training forward (e.g. 0.1):
+                                #   sigmoid((|alpha| - 0.5) / T), T from T0 to T0/100, then hard
+      hard_epochs: 3            #   for the last hard_epochs; null: hard masks all the time (PLiNIO)
+      select: best              # best: best.pt is the best epoch within budget (see margin);
+                                #   last: best.pt is always the latest epoch (masks lr annealed)
       discrete_cost: false      # regularizer on the cost of the binarized masks (STE), not the
                                 #   soft one; useful with small N, where the soft cost is too low
       latency: null             # adds the cost `latency` (ms, Raspberry Pi 5 LUT, yolopit.latency):
@@ -48,7 +53,7 @@ MODES = ("standard", "duccio")
 
 DEFAULTS = {
     "pit": dict(n=8, remainder=True, trace_imgsz=None, warmup_epochs=0, ema=False,
-                discrete_cost=False, latency=None),
+                discrete_cost=False, latency=None, select="best", temperature=None, hard_epochs=3),
     "nas": dict(optimizer="AdamW", lr0=0.01, lrf=1.0, cos_lr=False, weight_decay=0.0,
                 lr_lambda=None),
     "regularizer": dict(mode="standard"),
@@ -145,6 +150,11 @@ def split(conf: dict, legacy_cost: str = "ops") -> tuple[dict, dict]:
     groups["nas"] = {**DEFAULTS["nas"], **groups["nas"]}
     groups["regularizer"] = _check_regularizer(groups["regularizer"])
     _check_nas(groups["nas"])
+    t0 = groups["pit"]["temperature"]
+    if t0 is not None and (isinstance(t0, bool) or not isinstance(t0, (int, float)) or t0 <= 0):
+        raise ConfigError(f"pit.temperature must be null or a number > 0, got {t0!r}")
+    if groups["pit"]["select"] not in ("best", "last"):
+        raise ConfigError(f"pit.select must be 'best' or 'last', got {groups['pit']['select']!r}")
     if not isinstance(groups["pit"]["discrete_cost"], bool):
         raise ConfigError(f"pit.discrete_cost must be true or false, got "
                           f"{groups['pit']['discrete_cost']!r}")

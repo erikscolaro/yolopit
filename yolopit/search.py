@@ -360,6 +360,8 @@ class PITSearchTrainer(DetectionTrainer):
     NAS_LR_LAMBDA = None        # Python only: fn(search_epoch, search_epochs) -> factor
     NAS_WEIGHT_DECAY = 0.0
     NAS_OPTIMIZER = "AdamW"     # "AdamW", "Adam" or "SGD"
+    TEMP0 = None                # pit.temperature: T0 of the soft masks (None: hard)
+    HARD_EPOCHS = 3
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         super().__init__(cfg, apply_pit_defaults(overrides, "search"), _callbacks)
@@ -401,6 +403,8 @@ class PITSearchTrainer(DetectionTrainer):
         model.costs_cache = None
         model.reg_epoch = max(trainer.epoch - trainer.WARMUP_EPOCHS, 0)
         model.reg_epochs = max(trainer.epochs - trainer.WARMUP_EPOCHS, 1)
+        _masks.TEMPERATURE["T"] = (_masks.temperature_at(model.reg_epoch, model.reg_epochs, trainer.TEMP0,
+                                                         trainer.HARD_EPOCHS) if trainer.search_phase else 0.0)
         for lut in getattr(model, "latency_luts", {}).values():
             lut.progress = model.reg_epoch / max(model.reg_epochs - 1, 1)
         if trainer.search_phase and trainer.nas_optimizer is not None:
@@ -429,6 +433,8 @@ class PITSearchTrainer(DetectionTrainer):
         if trainer.nas_optimizer is not None:
             lr = trainer.nas_optimizer.param_groups[0]["lr"] if trainer.search_phase else 0.0
             trainer.lr["lr/masks"] = lr
+        if trainer.TEMP0:      # temperature of the masks in results.csv
+            trainer.lr["lr/T"] = _masks.TEMPERATURE["T"]
 
     # --- optimizers: weights -> Ultralytics optimizer, masks -> their own optimizer
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5,
@@ -494,6 +500,9 @@ class PITSearchTrainer(DetectionTrainer):
     #     epoch until one is; without targets (mode standard) it is always the latest epoch.
     def _update_best(self, ok: bool | None) -> bool:
         """Whether this epoch goes to best.pt; `ok`: costs within the budget (None: no targets)."""
+        if getattr(self, "SELECT", "best") == "last":    # pit.select: last -> always the latest
+            self.best_epoch = self.epoch
+            return True
         if ok is None:
             self.best_epoch = self.epoch
             return True
@@ -570,6 +579,7 @@ class PITSearchTrainer(DetectionTrainer):
 
     @staticmethod
     def _on_train_end(trainer):
+        _masks.TEMPERATURE["T"] = 0.0      # hard masks again outside the search
         model = unwrap_model(trainer.ema.ema)
         rows = model.channel_report()
         if not rows:
@@ -724,7 +734,8 @@ class PITYOLO:
             NAS_COS_LR=bool(nas["cos_lr"]),
             # staticmethod: a plain function stored on the class would be bound (self as arg 1)
             NAS_LR_LAMBDA=staticmethod(lr_lambda) if lr_lambda else None,
-            NAS_WEIGHT_DECAY=float(nas["weight_decay"])))
+            NAS_WEIGHT_DECAY=float(nas["weight_decay"]), SELECT=pit["select"],
+            TEMP0=pit["temperature"], HARD_EPOCHS=int(pit["hard_epochs"])))
         ultra["model"] = self.model.pit_meta["model"]
         self.trainer = trainer_cls(overrides=ultra)
         save_dir = Path(self.trainer.save_dir)

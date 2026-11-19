@@ -16,9 +16,9 @@ def test_within_budget():
     assert within_budget({"ops": 1e9}, {"mode": "standard"}) is None
 
 
-def run(epochs):
+def run(epochs, select="best"):
     """epochs: (fitness, ok) per epoch -> epochs saved to best.pt, and best_epoch at the end."""
-    t = SimpleNamespace(best_within_fitness=None, best_epoch=None)
+    t = SimpleNamespace(best_within_fitness=None, best_epoch=None, SELECT=select)
     saved = []
     for e, (fitness, ok) in enumerate(epochs):
         t.epoch, t.fitness = e, fitness
@@ -41,3 +41,8 @@ def test_best_is_latest_when_never_within_budget():
 def test_best_is_latest_without_targets():
     saved, best = run([(0.8, None), (0.5, None), (0.9, None)])
     assert saved == [0, 1, 2] and best == 2
+
+
+def test_select_last_is_always_latest():
+    saved, best = run([(0.8, False), (0.5, True), (0.9, True), (0.4, True)], select="last")
+    assert saved == [0, 1, 2, 3] and best == 3

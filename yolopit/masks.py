@@ -317,3 +317,50 @@ def pit_layers_feeding(pit_model: nn.Module, leaf_types) -> list:
                 continue
             stack.extend(n.all_input_nodes)
     return sorted(found)
+
+
+# --- temperature of the block masks (pit.temperature): in the training forward a block mask is
+#     sigmoid((theta - threshold) / T), normalized so a full channel (theta >= 1) counts 1, instead
+#     of the hard 0/1 with straight-through gradient. With the hard mask an undecided block is pushed
+#     up while off and down while on and sticks at the threshold; the soft one has no jump there.
+#     T = 0: PLiNIO's hard mask. The cost (DUCCIO), validation and export always use the hard mask.
+TEMPERATURE = {"T": 0.0}
+
+
+def _patch_soft_masks():
+    from plinio.methods.pit.nn.conv2d import PITConv2d
+    if getattr(PITConv2d, "_yolopit_soft", False):
+        return
+    fwd, mask = PITConv2d.forward, PITConv2d._features_mask
+
+    def forward(self, input):
+        self._soft_fwd = True              # only the masks of the forward, not those of the cost
+        try:
+            return fwd(self, input)
+        finally:
+            self._soft_fwd = False
+
+    def _features_mask(self, discrete):
+        T = TEMPERATURE["T"]
+        if (discrete and T > 0 and self.training and getattr(self, "_soft_fwd", False)
+                and isinstance(self.out_features_masker, PITBlockFeaturesMasker)):
+            thr = self.binarization_threshold
+            full = torch.sigmoid(torch.tensor((1.0 - thr) / T))
+            return torch.clamp(torch.sigmoid((self.out_features_masker.theta - thr) / T) / full, max=1.0)
+        return mask(self, discrete)
+
+    PITConv2d.forward, PITConv2d._features_mask, PITConv2d._yolopit_soft = forward, _features_mask, True
+
+
+def temperature_at(epoch: int, epochs: int, t0, hard_epochs: int) -> float:
+    """T at (0-based) search epoch: exponential from t0 to t0/100, then 0 for the last hard_epochs."""
+    if not t0:
+        return 0.0
+    soft = epochs - int(hard_epochs)
+    if epoch >= soft:
+        return 0.0
+    return float(t0) * 0.01 ** (epoch / max(soft - 1, 1))
+
+
+_patch_soft_masks()
+
