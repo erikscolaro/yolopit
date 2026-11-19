@@ -65,6 +65,68 @@ class YoloFx(nn.Module):
         return x
 
 
+class Detach(nn.Module):
+    """fx leaf: in training it cuts the gradient of the one2one branch, as Detect.forward does."""
+
+    def forward(self, x):
+        return x.detach() if self.training else x
+
+
+class DetectConvs(nn.Module):
+    """The convolutions of Detect as a traceable module (open head: PIT can prune them). Per level:
+    [box, cls, box one2one, cls one2one]. View, cat and decode stay outside the graph (`assemble`)."""
+
+    def __init__(self, d: Detect):
+        super().__init__()
+        self.cv2, self.cv3 = d.cv2, d.cv3
+        self.one2one_cv2, self.one2one_cv3 = d.one2one_cv2, d.one2one_cv3
+        self.f, self.i, self.nl, self.det = d.f, d.i, d.nl, Detach()
+
+    def forward(self, x):
+        out = []
+        for i in range(self.nl):
+            xd = self.det(x[i])
+            out += [self.cv2[i](x[i]), self.cv3[i](x[i]), self.one2one_cv2[i](xd), self.one2one_cv3[i](xd)]
+        return out
+
+
+def assemble(d: Detect, o: list):
+    """From the outputs of DetectConvs to what Detect.forward returns. `feats` only gives the map
+    sizes (anchors), so the box outputs stand for the input features."""
+    bs = o[0].shape[0]
+
+    def head(k):
+        b, c = o[k::4], o[k + 1::4]
+        return {"boxes": torch.cat([t.view(bs, 4 * d.reg_max, -1) for t in b], -1),
+                "scores": torch.cat([t.view(bs, d.nc, -1) for t in c], -1), "feats": list(b)}
+    preds = {"one2many": head(0), "one2one": head(2)}
+    if d.training:
+        return preds
+    y = d._inference(preds["one2one" if d.end2end else "one2many"])
+    if d.end2end:
+        y = d.postprocess(y.permute(0, 2, 1))
+    return y if d.export else (y, preds)
+
+
+def _as_list(h: nn.Module) -> nn.Module:
+    """fx keeps a traced container as a plain holder: back to Sequential where the children are numbered."""
+    kids = h._modules
+    if type(h) is nn.Module and kids and all(k.isdigit() for k in kids):
+        return nn.Sequential(*[_as_list(kids[k]) for k in sorted(kids, key=int)])
+    return h
+
+
+def link_head(detect: Detect, gm: nn.Module) -> Detect:
+    """A Detect whose conv lists ARE the modules of the graph `gm` (open head), so bias_init and
+    whatever reads detect.cv2/cv3 act on the convs that run. The input Detect is not modified."""
+    d = copy.copy(detect)
+    d._modules = dict(detect._modules)
+    holder = gm.get_submodule(f"layers.{detect.i}")
+    for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+        d._modules[name] = nn.ModuleList(_as_list(getattr(holder, name)))
+    return d
+
+
 class FxDetectionModel(DetectionModel):
     """A DetectionModel whose computation is a graph module (`net`). `self.model` only holds the
     Detect head, which the Ultralytics loss, validator and exporter look up as `model.model[-1]`.
@@ -85,10 +147,12 @@ class FxDetectionModel(DetectionModel):
         self.inplace = getattr(src, "inplace", True)
         self.pt_path = None
         self.pit_meta = dict(getattr(src, "pit_meta", {}) or {})
+        self.open_head = bool(getattr(src, "open_head", False))   # the graph ends at the Detect convs
 
     # --- Ultralytics hooks
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
-        return self.net(x)
+        out = self.net(x)
+        return assemble(self.model[0], out) if getattr(self, "open_head", False) else out
 
     def fuse(self, verbose=True, imgsz=640):
         return self  # BN already handled by the exporters; PIT layers must not be fused
