@@ -1,6 +1,6 @@
 """Mini-fit dello stimatore con la testa aperta: reti N- potate a caso (testa compresa), IR di deploy per il Pi.
 Come src.lut.b4r di yoloeval, ma con i pesi veri e gli strati della testa one2one.
-    cd ~/Desktop/yoloeval && PYTHONPATH=<worktree yolopit> YOLOPIT_OPEN_DETECT=1 .venv/bin/python <questo file> <dir> <best.pt> [n] [arch] [seed0]
+    cd ~/Desktop/yoloeval && PYTHONPATH=<worktree yolopit> .venv/bin/python <questo file> <dir> <best.pt> [n] [arch] [seed0]
 Scrive <dir>/results/nets.csv, layers.csv e <dir>/runs/nets/<rete>/ (IR + pt). Poi: python -m src.lut.pi b4r <dir>
 """
 import csv, shutil, sys, tempfile
@@ -45,7 +45,7 @@ def main(d: Path, weights: str, n: int = 32, arch: str = "w0.25_D101", seed0: in
     nets_rows, layer_rows = [], []
     for j in [-1, *range(n)]:
         name = f"{arch}_" + ("full" if j < 0 else f"h{j:03d}")
-        w = build_pit_model(weights, n=2, verbose=False)
+        w = build_pit_model(weights, n=2, verbose=False, open_detect=True)
         g = randomize(maskers(w), -1 if j < 0 else seed0 + j)
         costs = {m: float(v) for m, v in w.real_costs().items()}
         p = PITYOLO.__new__(PITYOLO); p.model, p.trainer = w, None

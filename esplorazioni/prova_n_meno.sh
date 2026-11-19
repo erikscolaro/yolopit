@@ -5,14 +5,14 @@
 #   systemd-run --user --unit=prova-detect --working-directory=$HOME/Desktop/yoloeval <questo file>
 set -uo pipefail
 cd /home/scolaroe/Desktop/yoloeval
-export PYTHONPATH=/home/scolaroe/Desktop/yolopit/.claude/worktrees/detect-aperta YOLOPIT_OPEN_DETECT=1
+export PYTHONPATH=/home/scolaroe/Desktop/yolopit/.claude/worktrees/detect-aperta
 D=experiments/pruning/pendenze/livello1; PY=.venv/bin/python; L=runs/catena_notte.log
 passo() { echo "[$(date '+%F %T')] detect aperta: $*" >> $L; }
 until grep -q "5. pendenza vincente" $L; do sleep 120; done
 W=$(grep -o "5. pendenza vincente: [a-z]*" $L | tail -1 | awk '{print $NF}')
 X="model=yolo26 model.width=0.25 model.depth=D101 strategy=pit_latency target=rpi5_640 target.lut_dir=artifacts/lut/rpi5_detect
    logging=local strategy.search.nas.optimizer=SGD strategy.search.nas.lr0=0.01 strategy.search.regularizer.strength=2
-   strategy.search.pit.latency.estimator=$W strategy.search.workers=8"
+   strategy.search.pit.latency.estimator=$W strategy.search.workers=8 +strategy.search.pit.open_detect=true"
 X=$(echo $X)
 passo "ricerca da N-, pendenza $W"
 if $PY run.py stage=search $X > runs/detect_search.log 2>&1; then

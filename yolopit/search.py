@@ -23,8 +23,6 @@ PIT and PLiNIO are by the EML-EDA group, Politecnico di Torino: see README, "Cre
 """
 from __future__ import annotations
 
-import os
-
 import copy
 import csv
 import json
@@ -65,8 +63,6 @@ from .runtime import (C3k2Split, Detach, DetectConvs, FxDetectionModel, YoloFx, 
                       link_head)
 
 LEAVES = (C2PSA, PSABlock, Detect)
-# exploration: YOLOPIT_OPEN_DETECT=1 traces the Detect convs (runtime.DetectConvs), so PIT prunes the head
-OPEN_DETECT = os.environ.get("YOLOPIT_OPEN_DETECT", "") == "1"
 ONE2MANY = ("cv2", "cv3")       # head branch used only in training: not in the deployed cost
 COSTS = {"ops": _cost_ops, "params": _cost_params}
 
@@ -214,11 +210,13 @@ def _pit_costs(pit, names, minimum: bool = False) -> dict:
 
 
 def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, verbose=True,
-                    cost=None, discrete_cost=False, latency=None) -> PITDetectionModel:
+                    cost=None, discrete_cost=False, latency=None, open_detect=False) -> PITDetectionModel:
     """YOLO26 weights/yaml -> PITDetectionModel wrapping a PIT model with block masks, with the
     costs of the whole model (initial, fixed part, minimum) at trace_imgsz. `cost` is ignored
     (kept for old calls: both costs are always tracked). discrete_cost=True: the regularizer
     sees the cost of the binarized masks (straight-through gradient) instead of the soft one.
+    open_detect=True traces the Detect convs (runtime.DetectConvs), so PIT prunes the head too
+    (exploration, off by default: the one2one branch is in the cost, one2many is trained only).
     latency={lut_dir, fit, arch}: adds the cost `latency` in ms (yolopit.latency), whose fixed
     part is the C_arch of the fit."""
     src = YOLO(model).model.float().eval()
@@ -228,7 +226,7 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
         if isinstance(layer, C3k2):
             src.model[i] = C3k2Split(layer).eval()
     detect = src.model[-1]
-    leaves = tuple(c for c in LEAVES if not (OPEN_DETECT and c is Detect))
+    leaves = tuple(c for c in LEAVES if not (open_detect and c is Detect))
     fixed, info = fixed_costs(src, leaves, detect, trace_imgsz, COSTS)
     costs_spec = dict(COSTS)
     latency_luts = {}
@@ -240,7 +238,7 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
             costs_spec["latency"], fixed["latency"], latency_luts = rpi5_latency(**latency)
         except KeyError as e:          # architecture not in the fit: a config problem
             raise ConfigError(str(e.args[0])) from None
-    if OPEN_DETECT:
+    if open_detect:
         src.model[-1] = DetectConvs(detect).eval()
         src.open_head = True
         info["detect_branch"] = "open: one2one in the cost, one2many trained only"
@@ -259,7 +257,7 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
                            f"layers: some layer is neither prunable nor in the fixed part, so the "
                            f"real cost would be wrong")
     feeding = pit_layers_feeding(pit, leaves)
-    if OPEN_DETECT:
+    if open_detect:
         # one2many is not deployed and costs nothing: its own convs stay at full width (as with the closed
         # head), only their inputs follow the neck. A masker shared with the neck (first depthwise) is not frozen.
         skip = tuple(f"layers.{detect.i}.{b}." for b in ONE2MANY)
@@ -269,7 +267,7 @@ def build_pit_model(model="yolo26n.pt", n=8, remainder=True, trace_imgsz=640, ve
                                          if n.startswith(skip) and id(l.out_features_masker) not in deployed})
     freeze_output_channels(pit, feeding, verbose=verbose)
     apply_block_masks(pit, n, remainder=remainder, verbose=verbose)
-    if OPEN_DETECT:
+    if open_detect:
         pit.cost_skip = tuple(f"layers.{detect.i}.{b}." for b in ONE2MANY)
         detect = link_head(detect, pit.seed)
 
@@ -731,11 +729,11 @@ class PITYOLO:
         if pit["trace_imgsz"] is None:
             pit["trace_imgsz"] = int(ultra.get("imgsz", 640))
         self.arch = {k: pit[k] for k in ("n", "remainder", "trace_imgsz", "discrete_cost",
-                                         "latency")}
+                                         "latency", "open_detect")}
         self.model = build_pit_model(model, n=int(pit["n"]), remainder=bool(pit["remainder"]),
                                      trace_imgsz=int(pit["trace_imgsz"]),
                                      discrete_cost=bool(pit["discrete_cost"]),
-                                     latency=pit["latency"])
+                                     latency=pit["latency"], open_detect=pit["open_detect"])
         self.trainer = None
 
     def train(self, cfg=None, **kwargs):

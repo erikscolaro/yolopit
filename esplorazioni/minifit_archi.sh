@@ -5,7 +5,7 @@
 set -uo pipefail
 cd /home/scolaroe/Desktop/yoloeval
 W=/home/scolaroe/Desktop/yolopit/.claude/worktrees/detect-aperta
-export PYTHONPATH=$W YOLOPIT_OPEN_DETECT=1 CUDA_VISIBLE_DEVICES=""
+export PYTHONPATH=$W CUDA_VISIBLE_DEVICES=""
 k=0
 for a in w0.1875_D101:w0.1875_D101 w0.125_D170:w0.125_D170 w0.1875_D126:w0.1875_D126 n_D126:w0.25_D126 w0.1875_D170:w0.1875_D170 w0.25_D170:w0.25_D170; do
   k=$((k+1)); file=${a%%:*}; arch=${a##*:}; D=artifacts/lut/rpi5_detect/minifit_$arch

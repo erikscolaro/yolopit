@@ -1,17 +1,16 @@
-"""Testa aperta integrata in yolopit (YOLOPIT_OPEN_DETECT=1): costruzione, equivalenza, costi, export, ricarica, bias_init.
-    CUDA_VISIBLE_DEVICES= YOLOPIT_OPEN_DETECT=1 python esplorazioni/test_integrazione.py <best.pt> <dir tmp>
+"""Testa aperta integrata in yolopit (pit.open_detect=true): costruzione, equivalenza, costi, export, ricarica, bias_init.
+    CUDA_VISIBLE_DEVICES= python esplorazioni/test_integrazione.py <best.pt> <dir tmp>
 """
 import os, sys, copy, torch
-assert os.environ.get("YOLOPIT_OPEN_DETECT") == "1"
 sys.path.insert(0, ".")
 from ultralytics import YOLO
 import yolopit, yolopit.search as S
 from yolopit.search import build_pit_model, PITYOLO
 print("yolopit da", yolopit.__file__)
 w, tmp = sys.argv[1], sys.argv[2]
-x = torch.rand(2, 3, 640, 640)
+torch.manual_seed(0); x = torch.rand(2, 3, 640, 640)   # input fisso: con uno casuale gli assert a 1e-3 a volte cadono
 ref = YOLO(w).model.float().eval()
-m = build_pit_model(w, n=2, verbose=False)
+m = build_pit_model(w, n=2, verbose=False, open_detect=True)
 c = m.pit_meta["costs"]["ops"]
 print("ops: tot %.4g pit %.4g fisso %.4g minimo %.4g (fisso %.0f%%, minimo %.0f%%)" % (c["total"], c["pit"], c["fixed"], c["min_total"], 100*c["fixed"]/c["total"], 100*c["min_total"]/c["total"]))
 m.eval()
@@ -19,9 +18,7 @@ with torch.no_grad():
     y0, y1 = ref(x)[0], m(x)[0]
 print("1) eval, differenza massima:", float((y0 - y1).abs().max())); assert torch.allclose(y0, y1, atol=1e-3)
 # costo totale = quello del modello chiuso (stessa rete di deploy)
-os.environ["YOLOPIT_OPEN_DETECT"] = "0"; S.OPEN_DETECT = False
 mc = build_pit_model(w, n=2, verbose=False); cc = mc.pit_meta["costs"]["ops"]
-S.OPEN_DETECT = True
 print("2) ops totali aperto %.6g, chiuso %.6g" % (c["total"], cc["total"])); assert abs(c["total"] - cc["total"]) / cc["total"] < 1e-6
 print("   minimo: aperto %.0f%%, chiuso %.0f%%" % (100*c["min_total"]/c["total"], 100*cc["min_total"]/cc["total"]))
 # train: dict con one2many e one2one, loss
